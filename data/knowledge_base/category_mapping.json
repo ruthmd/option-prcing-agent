@@ -1,0 +1,42 @@
+{
+  "pricing_models": [
+    0
+  ],
+  "parameters": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "greeks": [
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "strategies": [
+    11,
+    12,
+    13,
+    14
+  ],
+  "risk_management": [
+    15
+  ],
+  "volatility": [
+    16
+  ],
+  "arbitrage": [
+    17
+  ],
+  "time_decay": [
+    18
+  ],
+  "validation": [
+    19,
+    20,
+    21
+  ]
+}
