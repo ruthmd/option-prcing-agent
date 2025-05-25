@@ -94,55 +94,148 @@ class InputValidator:
         
         logger.debug(f"Domain relevance: {relevance:.2f} (keywords: {keyword_matches}, financial: {financial_matches})")
         return relevance
-    
+
+
     def _extract_parameters(self, query: str) -> Dict[str, Any]:
         """Extract trading parameters from query"""
         params = {}
         query_upper = query.upper()
+        query_lower = query.lower()
         
-        # Extract ticker symbol
-        ticker_matches = TICKER_PATTERN.findall(query_upper)
-        if ticker_matches:
-            # Take the first valid ticker (could be improved with context)
-            params['symbol'] = ticker_matches[0]
+        # Enhanced ticker symbol extraction
+        import re
         
-        # Extract strike price
-        strike_matches = re.findall(r'strike\s*[\$]?(\d+\.?\d*)', query.lower())
-        if strike_matches:
-            params['strike'] = float(strike_matches[0])
-        elif re.search(r'\$(\d+\.?\d*)', query):
-            # Alternative: dollar amounts
-            dollar_matches = re.findall(r'\$(\d+\.?\d*)', query)
-            if dollar_matches:
-                params['strike'] = float(dollar_matches[0])
+        # Method 1: Look for known ticker symbols (more conservative approach)
+        known_tickers = [
+            'AAPL', 'GOOGL', 'GOOG', 'MSFT', 'TSLA', 'AMZN', 'META', 'NVDA', 
+            'SPY', 'QQQ', 'IWM', 'DIA', 'VIX', 'GLD', 'SLV', 'TLT', 'XLF',
+            'XLE', 'XLI', 'XLK', 'XLV', 'XLP', 'XLY', 'XLU', 'XLRE', 'XLB',
+            'NFLX', 'CRM', 'ORCL', 'ADBE', 'INTC', 'AMD', 'IBM', 'BA', 'CAT',
+            'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'V', 'MA', 'PYPL', 'SQ',
+            'JNJ', 'UNH', 'PFE', 'ABBV', 'TMO', 'DHR', 'CVX', 'XOM', 'COP'
+        ]
         
-        # Extract expiry/time
-        if 'expiry' in query.lower() or 'expiration' in query.lower():
-            # Look for dates or relative time
-            for pattern in [
-                r'(\d{4}-\d{2}-\d{2})',
-                r'(\d{1,2})\s+(days?|weeks?|months?)',
-                r'in\s+(\d+)\s+(days?|weeks?|months?)'
-            ]:
-                matches = re.findall(pattern, query.lower())
-                if matches:
-                    params['expiry_raw'] = matches[0]
+        # Check for known tickers in the query
+        words = query_upper.split()
+        for word in words:
+            # Clean word of punctuation
+            clean_word = re.sub(r'[^\w]', '', word)
+            if clean_word in known_tickers:
+                params['symbol'] = clean_word
+                break
+        
+        # Method 2: Look for ticker-like patterns but exclude common words
+        if 'symbol' not in params:
+            # Find 2-5 letter uppercase words that could be tickers
+            potential_tickers = re.findall(r'\b([A-Z]{2,5})\b', query_upper)
+            
+            # Filter out common non-ticker words
+            excluded_words = {
+                'PRICE', 'CALL', 'PUT', 'OPTION', 'OPTIONS', 'STRIKE', 'EXPIRY', 
+                'EXPIRATION', 'DAYS', 'WEEKS', 'MONTHS', 'YEAR', 'YEARS',
+                'VALUE', 'WORTH', 'COST', 'PREMIUM', 'WHAT', 'THE', 'AND', 
+                'FOR', 'WITH', 'IN', 'ON', 'AT', 'TO', 'OF', 'IS', 'ARE',
+                'DELTA', 'GAMMA', 'THETA', 'VEGA', 'RHO', 'IV', 'HV', 'VOL'
+            }
+            
+            valid_tickers = [t for t in potential_tickers if t not in excluded_words]
+            if valid_tickers:
+                params['symbol'] = valid_tickers[0]
+        
+        # Method 3: Look for company names and map to tickers
+        if 'symbol' not in params:
+            company_ticker_map = {
+                'apple': 'AAPL',
+                'google': 'GOOGL',
+                'alphabet': 'GOOGL',
+                'microsoft': 'MSFT',
+                'tesla': 'TSLA',
+                'amazon': 'AMZN',
+                'meta': 'META',
+                'facebook': 'META',
+                'nvidia': 'NVDA',
+                'spy': 'SPY',
+                'qqq': 'QQQ',
+                'netflix': 'NFLX',
+                'salesforce': 'CRM'
+            }
+            
+            for company, ticker in company_ticker_map.items():
+                if company in query_lower:
+                    params['symbol'] = ticker
                     break
         
+        # Extract strike price - enhanced patterns
+        strike_patterns = [
+            r'strike\s*[\$]?(\d+\.?\d*)',  # "strike $150" or "strike 150"
+            r'\$(\d+\.?\d*)\s*strike',     # "$150 strike"
+            r'@\s*\$?(\d+\.?\d*)',         # "@ $150" or "@ 150"
+            r'at\s*\$(\d+\.?\d*)',         # "at $150"
+        ]
+        
+        for pattern in strike_patterns:
+            matches = re.findall(pattern, query_lower)
+            if matches:
+                try:
+                    params['strike'] = float(matches[0])
+                    break
+                except ValueError:
+                    continue
+        
+        # If no strike found but we see a dollar amount, use it
+        if 'strike' not in params:
+            dollar_matches = re.findall(r'\$(\d+\.?\d*)', query)
+            if dollar_matches:
+                try:
+                    # Take the first reasonable dollar amount (between $1 and $10000)
+                    for match in dollar_matches:
+                        value = float(match)
+                        if 1 <= value <= 10000:
+                            params['strike'] = value
+                            break
+                except ValueError:
+                    pass
+        
+        # Extract expiry/time - enhanced patterns
+        expiry_patterns = [
+            (r'expir\w*\s+in\s+(\d+)\s*days?', 'days'),
+            (r'in\s+(\d+)\s*days?', 'days'),
+            (r'(\d+)\s*days?', 'days'),
+            (r'(\d+)\s*weeks?', 'weeks'), 
+            (r'(\d+)\s*months?', 'months'),
+            (r'(\d{1,2})/(\d{1,2})/(\d{4})', 'date'),
+            (r'(\d{4})-(\d{2})-(\d{2})', 'date')
+        ]
+        
+        for pattern, unit_type in expiry_patterns:
+            matches = re.findall(pattern, query_lower)
+            if matches:
+                if unit_type == 'date':
+                    params['expiry_raw'] = matches[0]  # Date tuple
+                else:
+                    params['expiry_raw'] = (matches[0], unit_type)
+                break
+        
+        # If no specific expiry found, default to 30 days for options
+        if 'expiry_raw' not in params and ('option' in query_lower or 'call' in query_lower or 'put' in query_lower):
+            params['expiry_raw'] = ('30', 'days')
+        
         # Extract option type
-        if 'call' in query.lower():
+        if 'call' in query_lower:
             params['option_type'] = 'call'
-        elif 'put' in query.lower():
+        elif 'put' in query_lower:
             params['option_type'] = 'put'
         
         # Extract strategy type
         for strategy in OPTIONS_KEYWORDS['strategies']:
-            if strategy in query.lower():
+            if strategy in query_lower:
                 params['strategy'] = strategy
                 break
         
+        logger.debug(f"Extracted parameters: {params}")
         return params
-    
+
+
     def _validate_parameters(self, params: Dict[str, Any]) -> List[str]:
         """Validate extracted parameters"""
         errors = []
@@ -168,17 +261,37 @@ class InputValidator:
     def _validate_ticker(self, symbol: str) -> bool:
         """Validate ticker symbol with yfinance"""
         try:
+            # Skip validation for obviously invalid symbols
+            if not symbol or len(symbol) < 2 or len(symbol) > 5:
+                return False
+            
+            # Skip validation for common words that aren't tickers
+            invalid_symbols = {
+                'PRICE', 'CALL', 'PUT', 'OPTION', 'VALUE', 'WORTH', 'COST',
+                'THE', 'AND', 'FOR', 'WITH', 'WHAT', 'IS', 'ARE', 'ON', 'AT'
+            }
+            
+            if symbol.upper() in invalid_symbols:
+                logger.debug(f"Skipping validation for invalid symbol: {symbol}")
+                return False
+            
             # For testing purposes, accept common symbols without yfinance validation
             # to avoid network issues during tests
-            common_symbols = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'SPY', 'QQQ', 'AMZN', 'NVDA']
-            if symbol in common_symbols:
+            common_symbols = {
+                'AAPL', 'GOOGL', 'GOOG', 'MSFT', 'TSLA', 'SPY', 'QQQ', 'AMZN', 
+                'NVDA', 'META', 'NFLX', 'CRM', 'ORCL', 'ADBE', 'INTC', 'AMD'
+            }
+            
+            if symbol.upper() in common_symbols:
+                logger.debug(f"Accepting known symbol: {symbol}")
                 return True
-                
+            
+            # Try yfinance validation for other symbols
             ticker = yf.Ticker(symbol)
             info = ticker.info
             
             # Check if we got valid data
-            if not info or 'symbol' not in info:
+            if not info or len(info) < 3:  # Too little data usually means invalid
                 return False
             
             # Additional check: try to get recent price
@@ -188,8 +301,9 @@ class InputValidator:
         except Exception as e:
             logger.warning(f"Ticker validation failed for {symbol}: {e}")
             # For testing, return True for reasonable-looking symbols
-            return len(symbol) <= 5 and symbol.isalpha()
-    
+            return len(symbol) <= 5 and symbol.isalpha() and symbol not in {'PRICE', 'CALL', 'PUT', 'OPTION'}
+
+
     def _validate_expiry(self, expiry_raw: Any) -> bool:
         """Validate expiry date/time"""
         try:

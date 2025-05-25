@@ -61,7 +61,8 @@ class MarketDataAgent:
         cache_time = self.cache_timestamps[cache_key]
         cache_age = (datetime.now() - cache_time).total_seconds() / 60
         return cache_age < settings.CACHE_DURATION_MINUTES
-    
+
+
     def get_stock_data(
         self, 
         symbol: str, 
@@ -93,14 +94,34 @@ class MarketDataAgent:
                     error_message=f"No price data available for {symbol}"
                 )
             
-            # Get basic info
+            # Get basic info with error handling
             info = {}
             if include_info:
                 try:
-                    info = ticker.info
+                    raw_info = ticker.info
+                    if raw_info:
+                        # Extract safe values with defaults
+                        info = {
+                            'marketCap': raw_info.get('marketCap'),
+                            'dividendYield': raw_info.get('dividendYield', raw_info.get('trailingAnnualDividendYield', 0.0)),
+                            'beta': raw_info.get('beta'),
+                            'sector': raw_info.get('sector'),
+                            'industry': raw_info.get('industry'),
+                            'symbol': raw_info.get('symbol', symbol)
+                        }
+                        
+                        # Validate dividend yield
+                        dividend_yield = info.get('dividendYield', 0.0)
+                        if dividend_yield and dividend_yield > 0.25:  # More than 25% is suspicious
+                            logger.warning(f"Capping suspicious dividend yield for {symbol}: {dividend_yield:.2%} -> 5%")
+                            info['dividendYield'] = 0.05
+                        elif dividend_yield and dividend_yield < 0:
+                            logger.warning(f"Setting negative dividend yield to 0 for {symbol}")
+                            info['dividendYield'] = 0.0
+                            
                 except Exception as e:
-                    logger.warning(f"Failed to get info for {symbol}: {e}")
-                    info = {}
+                    logger.warning(f"Failed to get detailed info for {symbol}: {e}")
+                    info = {'dividendYield': 0.0}  # Provide safe default
             
             # Structure the data
             latest_data = hist.iloc[-1]
@@ -137,14 +158,15 @@ class MarketDataAgent:
                 data=data,
                 data_quality=quality_score
             )
-            
+
         except Exception as e:
             logger.error(f"Failed to fetch stock data for {symbol}: {e}")
             return MarketDataResult(
                 success=False,
                 error_message=f"Failed to fetch data for {symbol}: {str(e)}"
             )
-    
+
+
     def get_historical_data(
         self, 
         symbol: str, 
@@ -332,7 +354,19 @@ class MarketDataAgent:
         try:
             stock_data = self.get_stock_data(symbol, include_info=True)
             if stock_data.success and stock_data.data:
-                return stock_data.data.get('dividend_yield', 0.0) or 0.0
+                dividend_yield = stock_data.data.get('dividend_yield', 0.0) or 0.0
+                
+                # Validate and cap dividend yield to reasonable bounds
+                if dividend_yield > 0.2:  # More than 20% is suspicious
+                    logger.warning(f"Unusually high dividend yield for {symbol}: {dividend_yield:.2%}, capping at 5%")
+                    dividend_yield = 0.05  # Cap at 5%
+                elif dividend_yield < 0:
+                    logger.warning(f"Negative dividend yield for {symbol}: {dividend_yield:.2%}, setting to 0%")
+                    dividend_yield = 0.0
+                
+                logger.debug(f"Dividend yield for {symbol}: {dividend_yield:.2%}")
+                return dividend_yield
+            
             return 0.0
         except Exception as e:
             logger.warning(f"Failed to get dividend yield for {symbol}: {e}")

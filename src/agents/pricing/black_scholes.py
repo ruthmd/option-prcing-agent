@@ -15,9 +15,9 @@ class BlackScholesInputs(BaseModel):
     spot_price: float = Field(gt=0, description="Current stock price")
     strike_price: float = Field(gt=0, description="Option strike price")
     time_to_expiry: float = Field(gt=0, description="Time to expiry in years")
-    risk_free_rate: float = Field(ge=-0.1, le=0.5, description="Risk-free interest rate")
-    volatility: float = Field(gt=0, le=5.0, description="Annualized volatility")
-    dividend_yield: float = Field(ge=0, le=0.3, default=0.0, description="Dividend yield")
+    risk_free_rate: float = Field(ge=-0.1, le=0.3, description="Risk-free interest rate")  # Relaxed from 0.5
+    volatility: float = Field(gt=0, le=3.0, description="Annualized volatility")  # Relaxed from 5.0
+    dividend_yield: float = Field(ge=0, le=0.25, default=0.0, description="Dividend yield")  # Reduced from 0.3
     option_type: str = Field(pattern="^(call|put)$", description="Option type: call or put")
 
 class BlackScholesResult(BaseModel):

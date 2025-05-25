@@ -153,7 +153,7 @@ class OutputValidator:
             vol = context["volatility"]
             if vol > 2.0 and price < context.get("spot_price", 0) * 0.01:
                 result.warnings.append("Low option price despite high volatility")
-    
+
     def _validate_greeks(
         self, 
         greeks: Dict[str, float], 
@@ -162,7 +162,13 @@ class OutputValidator:
     ):
         """Validate Greeks output"""
         
-        option_type = context.get("option_type", "call").lower()
+        option_type = context.get("option_type")
+        if option_type:
+            option_type = option_type.lower()
+        else:
+            option_type = "unknown"  # Default fallback
+            result.warnings.append("Option type not specified for Greeks validation")
+        
         rules = self.validation_rules["greeks"]
         
         for greek_name, value in greeks.items():
@@ -181,6 +187,7 @@ class OutputValidator:
                             f"Put delta ({value:.4f}) outside normal range [{min_val}, {max_val}]"
                         )
                         result.confidence *= 0.9
+                # If option_type is unknown, skip delta range validation
             
             elif greek_name == "gamma":
                 if value < rules["gamma"]["min"]:
@@ -210,7 +217,7 @@ class OutputValidator:
             if np.isnan(value) or np.isinf(value):
                 result.is_valid = False
                 result.errors.append(f"Invalid {greek_name} value: {value}")
-    
+
     def _validate_volatility(
         self, 
         volatility: float, 
