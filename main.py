@@ -269,14 +269,11 @@ class OptionsAIAgentWithVisualization:
         try:
             print(f"\n🎨 Processing with enhanced visualization: {query}")
             result = self.process_query_with_visualization(query, generate_charts=True)
+            # _display_result_with_charts already prompts "Open dashboard in
+            # browser? (y/n)" and opens it if the user says yes — don't also
+            # open it unconditionally here, or a "n" answer gets ignored.
             self._display_result_with_charts(result)
-            
-            # Auto-open dashboard if available
-            if result.get("chart_files", {}).get("dashboard"):
-                dashboard_path = os.path.abspath(result["chart_files"]["dashboard"])
-                print(f"\n🌐 Opening dashboard in browser...")
-                webbrowser.open(f"file://{dashboard_path}")
-                
+
         except Exception as e:
             print(f"❌ Enhanced visualization failed: {e}")
     
@@ -707,13 +704,10 @@ async def main():
     if args.query:
         # Single query mode
         result = agent.process_query_with_visualization(args.query, generate_charts=args.viz)
+        # _display_result_with_charts already prompts "Open dashboard in
+        # browser? (y/n)" and opens it if the user says yes — don't also
+        # open it unconditionally here, or a "n" answer gets ignored.
         agent._display_result_with_charts(result)
-        
-        # Auto-open dashboard if visualization requested and available
-        if args.viz and result.get("chart_files", {}).get("dashboard"):
-            dashboard_path = os.path.abspath(result["chart_files"]["dashboard"])
-            print(f"\n🌐 Opening dashboard: {dashboard_path}")
-            webbrowser.open(f"file://{dashboard_path}")
     
     elif args.batch:
         # Batch mode
