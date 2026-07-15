@@ -1,6 +1,6 @@
 # src/providers/factory.py
 from src.providers.base import BaseLLMProvider
-from src.config import settings
+from src.config.settings import settings
 import logging
 
 logger = logging.getLogger(__name__)

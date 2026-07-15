@@ -40,35 +40,16 @@ class BinomialTreePricingAgent:
     def calculate_option_price(self, inputs: BinomialTreeInputs) -> BinomialTreeResult:
         """Calculate option price using binomial tree method"""
         try:
-            # Validate inputs
-            self._validate_inputs(inputs)
-            
-            # Calculate tree parameters
-            dt = inputs.time_to_expiry / inputs.steps
-            u, d, p = self._calculate_tree_parameters(inputs, dt)
-            
-            # Build stock price tree
-            stock_tree = self._build_stock_tree(inputs, u, d)
-            
-            # Build option price tree and find optimal exercise boundary
-            option_tree, exercise_boundary = self._build_option_tree(inputs, stock_tree, p, dt)
-            
-            # Extract results
-            option_price = option_tree[0, 0]
-            
-            # Calculate intrinsic value
-            if inputs.option_type.lower() == "call":
-                intrinsic_value = max(0, inputs.spot_price - inputs.strike_price)
-            else:
-                intrinsic_value = max(0, inputs.strike_price - inputs.spot_price)
-            
+            option_price, intrinsic_value, exercise_boundary, european_price = self._price_core(inputs)
+
             # Calculate early exercise premium (American vs European)
-            european_price = self._calculate_european_price(inputs, stock_tree, p, dt)
             early_exercise_premium = option_price - european_price
-            
-            # Calculate Greeks using finite differences
+
+            # Calculate Greeks using finite differences (does NOT recurse back
+            # into this method — it reprices via _price_only to avoid
+            # unbounded recursion through repeated Greeks calculation)
             greeks = self._calculate_greeks(inputs)
-            
+
             result = BinomialTreeResult(
                 option_price=round(option_price, 4),
                 intrinsic_value=round(intrinsic_value, 4),
@@ -78,14 +59,39 @@ class BinomialTreePricingAgent:
                 greeks=greeks,
                 inputs=inputs
             )
-            
+
             logger.debug(f"Binomial tree calculation completed: {inputs.option_type} price = {option_price:.4f}")
             return result
-            
+
         except Exception as e:
             logger.error(f"Binomial tree calculation failed: {e}")
             raise ValueError(f"Binomial tree calculation error: {str(e)}")
-    
+
+    def _price_core(self, inputs: BinomialTreeInputs) -> Tuple[float, float, List[Tuple[int, float]], float]:
+        """Core tree pricing, with no Greeks computation — safe to call repeatedly for bumped inputs"""
+        self._validate_inputs(inputs)
+
+        dt = inputs.time_to_expiry / inputs.steps
+        u, d, p = self._calculate_tree_parameters(inputs, dt)
+
+        stock_tree = self._build_stock_tree(inputs, u, d)
+        option_tree, exercise_boundary = self._build_option_tree(inputs, stock_tree, p, dt)
+        option_price = option_tree[0, 0]
+
+        if inputs.option_type.lower() == "call":
+            intrinsic_value = max(0, inputs.spot_price - inputs.strike_price)
+        else:
+            intrinsic_value = max(0, inputs.strike_price - inputs.spot_price)
+
+        european_price = self._calculate_european_price(inputs, stock_tree, p, dt)
+
+        return option_price, intrinsic_value, exercise_boundary, european_price
+
+    def _price_only(self, inputs: BinomialTreeInputs) -> float:
+        """Price-only helper for Greeks finite-differencing — never touches Greeks"""
+        option_price, _, _, _ = self._price_core(inputs)
+        return option_price
+
     def _validate_inputs(self, inputs: BinomialTreeInputs):
         """Validate input parameters"""
         if inputs.spot_price <= 0:
@@ -215,55 +221,55 @@ class BinomialTreePricingAgent:
     def _calculate_greeks(self, inputs: BinomialTreeInputs) -> Dict[str, float]:
         """Calculate Greeks using finite differences"""
         try:
-            base_price = self.calculate_option_price(inputs).option_price
-            
+            base_price = self._price_only(inputs)
+
             # Delta: sensitivity to underlying price
             spot_shift = inputs.spot_price * 0.01  # 1% shift
             inputs_up = inputs.copy()
             inputs_up.spot_price = inputs.spot_price + spot_shift
             inputs_down = inputs.copy()
             inputs_down.spot_price = inputs.spot_price - spot_shift
-            
-            price_up = self.calculate_option_price(inputs_up).option_price
-            price_down = self.calculate_option_price(inputs_down).option_price
-            
+
+            price_up = self._price_only(inputs_up)
+            price_down = self._price_only(inputs_down)
+
             delta = (price_up - price_down) / (2 * spot_shift)
-            
+
             # Gamma: second derivative with respect to underlying
             gamma = (price_up - 2 * base_price + price_down) / (spot_shift ** 2)
-            
+
             # Theta: sensitivity to time decay
             time_shift = 1 / 365  # 1 day
             if inputs.time_to_expiry > time_shift:
                 inputs_theta = inputs.copy()
                 inputs_theta.time_to_expiry = inputs.time_to_expiry - time_shift
-                price_theta = self.calculate_option_price(inputs_theta).option_price
+                price_theta = self._price_only(inputs_theta)
                 theta = (price_theta - base_price) / time_shift
             else:
                 theta = 0.0
-            
+
             # Vega: sensitivity to volatility
             vol_shift = 0.01  # 1% volatility shift
             inputs_vega_up = inputs.copy()
             inputs_vega_up.volatility = inputs.volatility + vol_shift
             inputs_vega_down = inputs.copy()
             inputs_vega_down.volatility = max(0.001, inputs.volatility - vol_shift)
-            
-            price_vega_up = self.calculate_option_price(inputs_vega_up).option_price
-            price_vega_down = self.calculate_option_price(inputs_vega_down).option_price
-            
+
+            price_vega_up = self._price_only(inputs_vega_up)
+            price_vega_down = self._price_only(inputs_vega_down)
+
             vega = (price_vega_up - price_vega_down) / (2 * vol_shift)
-            
+
             # Rho: sensitivity to interest rate
             rate_shift = 0.01  # 1% rate shift
             inputs_rho_up = inputs.copy()
             inputs_rho_up.risk_free_rate = inputs.risk_free_rate + rate_shift
             inputs_rho_down = inputs.copy()
             inputs_rho_down.risk_free_rate = inputs.risk_free_rate - rate_shift
-            
-            price_rho_up = self.calculate_option_price(inputs_rho_up).option_price
-            price_rho_down = self.calculate_option_price(inputs_rho_down).option_price
-            
+
+            price_rho_up = self._price_only(inputs_rho_up)
+            price_rho_down = self._price_only(inputs_rho_down)
+
             rho = (price_rho_up - price_rho_down) / (2 * rate_shift)
             
             return {

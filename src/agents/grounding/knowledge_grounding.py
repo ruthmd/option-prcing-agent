@@ -158,6 +158,16 @@ class KnowledgeGroundingAgent:
                 "content": "Time decay (theta) accelerates as options approach expiration, especially for at-the-money options",
                 "category": "time_decay",
                 "subcategory": "theta_behavior"
+            },
+            {
+                "content": (
+                    "Moneyness classifies an option by the relationship between the underlying price and the strike. "
+                    "A call is in-the-money (ITM) when the underlying is above the strike, at-the-money (ATM) when "
+                    "they're roughly equal, and out-of-the-money (OTM) when the underlying is below the strike. "
+                    "A put is the reverse: ITM when the underlying is below the strike, OTM when above."
+                ),
+                "category": "moneyness",
+                "subcategory": "itm_atm_otm"
             }
         ]
         

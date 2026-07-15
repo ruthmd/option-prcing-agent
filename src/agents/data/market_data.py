@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 from loguru import logger
 import time
-from functools import lru_cache
 import warnings
 
 from ...config.settings import settings
@@ -107,7 +106,8 @@ class MarketDataAgent:
                             'beta': raw_info.get('beta'),
                             'sector': raw_info.get('sector'),
                             'industry': raw_info.get('industry'),
-                            'symbol': raw_info.get('symbol', symbol)
+                            'symbol': raw_info.get('symbol', symbol),
+                            'quoteType': raw_info.get('quoteType', 'EQUITY')
                         }
                         
                         # Validate dividend yield
@@ -121,7 +121,7 @@ class MarketDataAgent:
                             
                 except Exception as e:
                     logger.warning(f"Failed to get detailed info for {symbol}: {e}")
-                    info = {'dividendYield': 0.0}  # Provide safe default
+                    info = {'dividendYield': 0.0, 'quoteType': 'EQUITY'}  # Provide safe default
             
             # Structure the data
             latest_data = hist.iloc[-1]
@@ -138,6 +138,7 @@ class MarketDataAgent:
                 "beta": info.get('beta'),
                 "sector": info.get('sector'),
                 "industry": info.get('industry'),
+                "quote_type": info.get('quoteType', 'EQUITY'),
                 "last_updated": datetime.now().isoformat()
             }
             
@@ -320,7 +321,6 @@ class MarketDataAgent:
                 error_message=f"Failed to fetch options chain: {str(e)}"
             )
     
-    @lru_cache(maxsize=32)
     def get_risk_free_rate(self) -> float:
         """Get current risk-free rate (10-year Treasury)"""
         

@@ -24,7 +24,7 @@ class BaseLLMProvider(ABC):
 
     def _get_temperature(self, task_type: str) -> float:
         """Map task type to the correct temperature from settings."""
-        from src.config import settings
+        from src.config.settings import settings
         return {
             "pricing":    settings.MODEL_TEMP_PRICING,
             "analysis":   settings.MODEL_TEMP_ANALYSIS,

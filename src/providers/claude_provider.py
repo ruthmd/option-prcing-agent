@@ -1,7 +1,7 @@
 # src/providers/claude_provider.py
 from langchain_anthropic import ChatAnthropic
 from src.providers.base import BaseLLMProvider
-from src.config import settings
+from src.config.settings import settings
 import logging
 
 logger = logging.getLogger(__name__)
