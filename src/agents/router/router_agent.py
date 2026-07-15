@@ -12,7 +12,6 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 import numpy as np
 
 from ...providers.factory import get_llm
-from ...providers.openai_provider import OpenAIProvider
 from ..grounding.input_validator import InputValidator, ValidationResult
 from ..grounding.knowledge_grounding import KnowledgeGroundingAgent, GroundingResult
 from ..grounding.output_validator import OutputValidator, OutputValidationResult
@@ -84,6 +83,8 @@ class RouterAgent:
         self.binomial_tree_agent = BinomialTreePricingAgent()
         self.monte_carlo_agent = MonteCarloPricingAgent()
         self.volatility_agent = VolatilityAgent()
+        self.strategy_agent = StrategyAnalysisAgent()
+        self.risk_management_agent = RiskManagementAgent()
         
         # Initialize LLM
         self.llm = self._initialize_llm()
@@ -449,21 +450,33 @@ class RouterAgent:
         """Extract appropriate strikes for strategy"""
         if "strikes" in parsed_params and parsed_params["strikes"]:
             return parsed_params["strikes"]
-        # Generate default strikes based on strategy type
+
+        # Anchor default strike generation on the user-specified strike when
+        # present, falling back to spot price (ATM) otherwise. This used to
+        # check parsed_params["strikes"] (plural) only, which InputValidator
+        # never sets — it only ever produces "strike" (singular) — so a
+        # user-specified strike was silently discarded for every strategy query.
+        anchor = parsed_params.get("strike", spot_price)
+
+        # Generate default strikes based on strategy type, anchored around `anchor`
         if strategy_type in [StrategyType.LONG_STRADDLE, StrategyType.SHORT_STRADDLE]:
-            return [spot_price]  # ATM straddle
+            return [anchor]  # ATM straddle
         elif strategy_type in [StrategyType.LONG_STRANGLE, StrategyType.SHORT_STRANGLE]:
-            return [spot_price * 0.95, spot_price * 1.05]  # 5% OTM strangle
+            return [anchor * 0.95, anchor * 1.05]  # 5% OTM strangle
         elif strategy_type == StrategyType.IRON_CONDOR:
-            return [spot_price * 0.90, spot_price * 0.95, spot_price * 1.05, spot_price * 1.10]  # Iron condor strikes
+            return [anchor * 0.90, anchor * 0.95, anchor * 1.05, anchor * 1.10]  # Iron condor strikes
         elif strategy_type == StrategyType.BULL_CALL_SPREAD:
-            return [spot_price * 0.98, spot_price * 1.05]  # Bull call spread
+            return [anchor * 0.98, anchor * 1.05]  # Bull call spread
         elif strategy_type == StrategyType.BEAR_PUT_SPREAD:
-            return [spot_price * 1.02, spot_price * 0.95]  # Bear put spread
-        elif strategy_type in [StrategyType.LONG_BUTTERFLY, StrategyType.IRON_BUTTERFLY]:
-            return [spot_price * 0.95, spot_price, spot_price * 1.05]  # Butterfly strikes
+            return [anchor * 1.02, anchor * 0.95]  # Bear put spread
+        elif strategy_type in [StrategyType.LONG_BUTTERFLY, StrategyType.SHORT_BUTTERFLY, StrategyType.IRON_BUTTERFLY]:
+            return [anchor * 0.95, anchor, anchor * 1.05]  # Butterfly strikes
+        elif strategy_type == StrategyType.COLLAR:
+            return [anchor * 0.95, anchor * 1.05]  # protective put (lower), covered call (higher)
+        elif strategy_type == StrategyType.CALENDAR_SPREAD:
+            return [anchor]  # same strike, both legs
         else:
-            return [spot_price]  # Default to ATM
+            return [anchor]  # single-leg strategies (long/short call/put, covered call, protective put)
     
 
     def _identify_strategy_type(self, query: str) -> Optional[StrategyType]:
@@ -471,6 +484,8 @@ class RouterAgent:
         strategy_keywords = {
             "long call": StrategyType.LONG_CALL,
             "long put": StrategyType.LONG_PUT,
+            "short call": StrategyType.SHORT_CALL,
+            "short put": StrategyType.SHORT_PUT,
             "covered call": StrategyType.COVERED_CALL,
             "protective put": StrategyType.PROTECTIVE_PUT,
             "bull call spread": StrategyType.BULL_CALL_SPREAD,
@@ -482,6 +497,9 @@ class RouterAgent:
             "iron condor": StrategyType.IRON_CONDOR,
             "iron butterfly": StrategyType.IRON_BUTTERFLY,
             "long butterfly": StrategyType.LONG_BUTTERFLY,
+            "short butterfly": StrategyType.SHORT_BUTTERFLY,
+            "calendar spread": StrategyType.CALENDAR_SPREAD,
+            "collar": StrategyType.COLLAR,
             "straddle": StrategyType.LONG_STRADDLE,  # Default to long
             "strangle": StrategyType.LONG_STRANGLE,  # Default to long
             "butterfly": StrategyType.LONG_BUTTERFLY,  # Default to long
@@ -917,7 +935,8 @@ class RouterAgent:
                 "complexity_rating": result.complexity_rating,
                 "risk_warnings": result.risk_warnings,
                 "management_guidelines": result.management_guidelines,
-                "payoff_data": result.payoff_data
+                "payoff_data": result.payoff_data,
+                "price_range": result.price_range
             }
             
         except Exception as e:
@@ -1283,14 +1302,19 @@ class RouterAgent:
     def _judge_response_node(self, state: AgentState) -> AgentState:
         """Independent cross-provider check on educational/low-confidence responses.
 
-        Uses OpenAI (a different provider than the one that generated the response)
-        to judge whether the response is consistent with established options theory.
-        Runs only for educational queries or when grounding confidence is already low —
-        running it on every routine pricing query would add cost/latency for cases
-        where there's little to hallucinate (a Black-Scholes number is just a number).
-        Skips silently (no pipeline failure) if OPENAI_API_KEY isn't configured.
+        Uses the LLM_JUDGE provider (independent of LLM_PROVIDER, which generated
+        the response) to judge whether the response is consistent with established
+        options theory. Runs only for educational queries or when grounding
+        confidence is already low — running it on every routine pricing query would
+        add cost/latency for cases where there's little to hallucinate (a
+        Black-Scholes number is just a number). Set LLM_JUDGE=none to disable
+        entirely. Skips silently (no pipeline failure) on any provider/config error.
         """
         try:
+            if settings.LLM_JUDGE.lower() == "none":
+                logger.info("LLM-as-judge: disabled (LLM_JUDGE=none)")
+                return state
+
             query_type = state["query_type"]
             confidence = state.get("confidence_score", 1.0)
             should_judge = (
@@ -1298,11 +1322,22 @@ class RouterAgent:
             )
 
             if not should_judge or not state.get("response_message"):
+                logger.debug(
+                    f"LLM-as-judge: not triggered (query_type={query_type.value}, "
+                    f"confidence={confidence:.2f}, threshold={settings.CONFIDENCE_THRESHOLD})"
+                )
                 return state
 
-            if not settings.OPENAI_API_KEY or settings.OPENAI_API_KEY.startswith("<"):
-                logger.debug("Skipping LLM-as-judge check: OPENAI_API_KEY not configured")
-                return state
+            if settings.LLM_JUDGE.lower() == settings.LLM_PROVIDER.lower():
+                logger.debug(
+                    f"LLM_JUDGE and LLM_PROVIDER are both '{settings.LLM_PROVIDER}' — "
+                    "the judge won't be independent of the model that generated the response"
+                )
+
+            logger.info(
+                f"LLM-as-judge: triggered (query_type={query_type.value}, "
+                f"confidence={confidence:.2f}) — checking with provider='{settings.LLM_JUDGE}'"
+            )
 
             grounding = state.get("knowledge_grounding")
             grounding_context = "\n".join(
@@ -1313,26 +1348,33 @@ class RouterAgent:
 
             if verdict:
                 state["judge_verdict"] = verdict
+                logger.info(
+                    f"LLM-as-judge: provider='{settings.LLM_JUDGE}' verdict — "
+                    f"grounded={verdict.get('grounded')}, confidence={verdict.get('confidence', 0):.2f}, "
+                    f"concerns={len(verdict.get('concerns', []))}"
+                )
                 if not verdict.get("grounded", True) or verdict.get("concerns"):
                     review_lines = [
                         "",
-                        f"🔍 Independent Review (OpenAI, confidence: {verdict.get('confidence', 0):.0%}):"
+                        f"🔍 Independent Review ({settings.LLM_JUDGE}, confidence: {verdict.get('confidence', 0):.0%}):"
                     ]
                     for concern in verdict.get("concerns", []):
                         review_lines.append(f"• {concern}")
                     state["response_message"] += "\n" + "\n".join(review_lines)
+            else:
+                logger.warning(f"LLM-as-judge: provider='{settings.LLM_JUDGE}' returned no verdict (see prior warning for cause)")
 
             state["processing_steps"].append("LLM-as-judge review completed")
 
         except Exception as e:
-            logger.warning(f"LLM-as-judge review failed, continuing without it: {e}")
+            logger.warning(f"LLM-as-judge review failed (provider='{settings.LLM_JUDGE}'), continuing without it: {e}")
 
         return state
 
     def _run_llm_judge(self, query: str, response_text: str, grounding_context: str) -> Optional[Dict[str, Any]]:
-        """Ask an independent OpenAI model to fact-check the response against known theory"""
+        """Ask the configured LLM_JUDGE provider to fact-check the response against known theory"""
         try:
-            judge_llm = OpenAIProvider().get_llm("validation")
+            judge_llm = get_llm("validation", provider_name=settings.LLM_JUDGE)
 
             system_prompt = (
                 "You are an independent fact-checker for an options-trading assistant. "
@@ -1356,13 +1398,13 @@ class RouterAgent:
             content = getattr(result, "content", None) or str(result)
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if not match:
-                logger.warning(f"LLM judge did not return parseable JSON: {content[:200]}")
+                logger.warning(f"LLM judge (provider='{settings.LLM_JUDGE}') did not return parseable JSON: {content[:200]}")
                 return None
 
             return json.loads(match.group(0))
 
         except Exception as e:
-            logger.warning(f"LLM judge call failed: {e}")
+            logger.warning(f"LLM judge call failed (provider='{settings.LLM_JUDGE}'): {e}")
             return None
 
     # def _format_result_for_response(self, result: Dict[str, Any], query_type: QueryType) -> str:
@@ -1634,7 +1676,42 @@ class RouterAgent:
                 # Prepare volatility surface if available
                 if "volatility_surface" in final_result:
                     viz_data["volatility_surface"] = self._generate_volatility_surface_data(final_result)
-            
+
+            elif query_type == QueryType.STRATEGY_ANALYSIS and final_result and "error" not in final_result:
+                # Prepare strategy payoff diagram data
+                payoff_data = final_result.get("payoff_data")
+                price_range = final_result.get("price_range")
+                if payoff_data and price_range:
+                    viz_data["strategy_payoff"] = {
+                        "type": "line",
+                        "data": {
+                            "x": price_range,
+                            "y": payoff_data.get("total_payoff", []),
+                            "strategy_name": final_result.get("strategy_name", "Strategy"),
+                            "breakeven_points": final_result.get("breakeven_points", [])
+                        }
+                    }
+
+                # Prepare portfolio Greeks radar chart data (reuses the same
+                # "greeks_chart" key/shape as OPTION_PRICING — main.py's chart
+                # generation checks for this key unconditionally, regardless of
+                # query type)
+                portfolio_greeks = final_result.get("portfolio_greeks")
+                if portfolio_greeks:
+                    viz_data["greeks_chart"] = {
+                        "type": "radar",
+                        "data": {
+                            "labels": ["Delta", "Gamma", "Theta", "Vega", "Rho"],
+                            "values": [
+                                abs(portfolio_greeks.get("delta", 0)),
+                                portfolio_greeks.get("gamma", 0) * 10,
+                                abs(portfolio_greeks.get("theta", 0)) * 10,
+                                portfolio_greeks.get("vega", 0) / 100,
+                                abs(portfolio_greeks.get("rho", 0)) / 100
+                            ]
+                        }
+                    }
+
             logger.info(f"Prepared {len(viz_data)} visualization data sets")
             return viz_data
             

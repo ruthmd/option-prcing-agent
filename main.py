@@ -487,7 +487,8 @@ async def create_batch_dashboard(results: list, agent):
         
         if all_charts:
             from datetime import datetime
-            dashboard_file = f"outputs/batch_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            Path("visualizations/batch_results").mkdir(parents=True, exist_ok=True)
+            dashboard_file = f"visualizations/batch_results/batch_dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
             saved_dashboard = agent.visualizer.save_dashboard_as_html(all_charts, dashboard_file)
             
             if saved_dashboard:

@@ -8,6 +8,12 @@ class Settings(BaseSettings):
     # Switch between: "local", "openai", "claude"
     LLM_PROVIDER: str = "local"
 
+    # ── LLM-as-Judge (independent grounding check) ─────────────────────
+    # Provider used to fact-check responses, kept independent from LLM_PROVIDER
+    # so the same model isn't grading its own output. "none" disables the check.
+    # Switch between: "local", "openai", "claude", "none"
+    LLM_JUDGE: str = "openai"
+
     # ── Local (Ollama) ────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2"

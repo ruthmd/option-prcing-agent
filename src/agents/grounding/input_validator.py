@@ -39,13 +39,17 @@ class InputValidator:
             domain_relevance=domain_relevance  # Set this field immediately
         )
         
-        # Check if query is relevant to options domain
+        # Check if query is relevant to options domain. Below-threshold relevance
+        # is recorded as an error/reduced confidence, but does NOT skip parameter
+        # extraction below — the router still processes borderline-relevance
+        # queries (see _classify_query_node's 0.3 hard-reject cutoff), so a query
+        # that's merely borderline shouldn't silently lose its parsed symbol/strike/
+        # expiry just because the relevance heuristic scored it under the threshold.
         if domain_relevance < settings.DOMAIN_RELEVANCE_THRESHOLD:
             result.is_valid = False
             result.errors.append(ERROR_MESSAGES['out_of_domain'])
             result.confidence = domain_relevance
-            return result
-        
+
         # Extract and validate parameters
         try:
             parsed_params = self._extract_parameters(query)
