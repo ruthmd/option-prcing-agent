@@ -236,10 +236,27 @@ class MarketDataAgent:
                 error_message=f"Failed to fetch historical data: {str(e)}"
             )
     
-    def get_options_chain(self, symbol: str, expiration: Optional[str] = None) -> MarketDataResult:
-        """Get options chain data"""
-        
-        cache_key = f"options_{symbol}_{expiration or 'all'}"
+    def get_options_chain(
+        self,
+        symbol: str,
+        expiration: Optional[str] = None,
+        target_days_to_expiry: Optional[int] = None
+    ) -> MarketDataResult:
+        """Get options chain data.
+
+        expiration: use this exact expiration (takes priority over target_days_to_expiry).
+        target_days_to_expiry: auto-select the available expiration closest to this
+            many days out (e.g. 30, matching the standard IV convention), instead of
+            just the nearest one — a 1-2 DTE chain has near-zero vega and produces
+            numerically unstable implied volatility even off clean, live quotes.
+        """
+        if expiration:
+            cache_suffix = expiration
+        elif target_days_to_expiry is not None:
+            cache_suffix = f"target{target_days_to_expiry}"
+        else:
+            cache_suffix = "nearest"
+        cache_key = f"options_{symbol}_{cache_suffix}"
         
         if self._is_cache_valid(cache_key):
             return MarketDataResult(
@@ -266,8 +283,34 @@ class MarketDataAgent:
                     error_message=f"Failed to get options expirations for {symbol}: {str(e)}"
                 )
             
-            # Get options chain for specific expiration or first available
-            target_expiration = expiration or expirations[0]
+            # Get options chain for specific expiration or nearest available with
+            # real time value remaining. Auto-selection skips already-expired or
+            # same-day (0 DTE) expirations — at ~0 days to expiry, an option's
+            # price is almost pure intrinsic value with near-zero vega, so any
+            # tiny bid-ask noise back-solves into wildly unstable/nonsensical
+            # implied volatility (100%+ from noise alone). An explicitly
+            # requested `expiration` is always honored as-is, even if it's 0 DTE.
+            if expiration:
+                target_expiration = expiration
+            else:
+                today = datetime.now().date()
+                future_expirations = [
+                    exp for exp in expirations
+                    if datetime.strptime(exp, '%Y-%m-%d').date() > today
+                ]
+                candidates = future_expirations if future_expirations else expirations
+
+                if target_days_to_expiry is not None:
+                    # Pick whichever available expiration is closest to the
+                    # target horizon, rather than just the nearest one
+                    target_expiration = min(
+                        candidates,
+                        key=lambda exp: abs(
+                            (datetime.strptime(exp, '%Y-%m-%d').date() - today).days - target_days_to_expiry
+                        )
+                    )
+                else:
+                    target_expiration = candidates[0]
             
             if target_expiration not in expirations:
                 return MarketDataResult(

@@ -31,8 +31,14 @@ OPTIONS_KEYWORDS = {
         'calendar spread'
     },
     'risk_terms': {
+        # 'hedg' root covers "hedge"/"hedges"/"hedged"/"hedging". This set now
+        # mirrors the keyword list _perform_classification uses to route to
+        # RISK_MANAGEMENT — previously it didn't, so risk-management queries
+        # could score too low here and get hard-rejected as INVALID before
+        # classification ever got a chance to recognize them.
         'volatility', 'implied volatility', 'historical volatility', 'skew',
-        'hedging', 'delta neutral', 'gamma hedging', 'arbitrage'
+        'hedg', 'delta neutral', 'gamma hedging', 'arbitrage',
+        'risk', 'var', 'portfolio', 'concentration', 'drawdown'
     }
 }
 

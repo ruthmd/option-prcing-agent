@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, END
 # from langgraph.prebuilt import ToolExecutor
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 import numpy as np
+import pandas as pd
 
 from ...providers.factory import get_llm
 from ..grounding.input_validator import InputValidator, ValidationResult
@@ -303,9 +304,19 @@ class RouterAgent:
                             market_data["volatility_data"] = vol_result.data
                             logger.info(f"Historical volatility for {symbol}: {vol_result.data['volatility']:.1%}")
                     
-                    # Get options chain if needed
-                    if query_type in [QueryType.OPTION_PRICING, QueryType.STRATEGY_ANALYSIS, QueryType.ARBITRAGE_DETECTION]:
-                        options_result = self.market_data_agent.get_options_chain(symbol)
+                    # Get options chain if needed. Volatility analysis targets a
+                    # ~30-day horizon specifically (standard IV convention) rather
+                    # than just the nearest expiration — pricing/strategy/arbitrage
+                    # queries still get literally the nearest available contract,
+                    # since that's what a real trader looking at that option would
+                    # expect.
+                    if query_type in [QueryType.OPTION_PRICING, QueryType.STRATEGY_ANALYSIS, QueryType.ARBITRAGE_DETECTION, QueryType.VOLATILITY_ANALYSIS]:
+                        if query_type == QueryType.VOLATILITY_ANALYSIS:
+                            options_result = self.market_data_agent.get_options_chain(
+                                symbol, target_days_to_expiry=settings.VOLATILITY_TARGET_DTE
+                            )
+                        else:
+                            options_result = self.market_data_agent.get_options_chain(symbol)
                         if options_result.success:
                             market_data["options_data"] = options_result.data
                             logger.info(f"Options chain fetched for {symbol}")
@@ -746,11 +757,24 @@ class RouterAgent:
                     "risk_free_rate": risk_free_rate,
                     "dividend_yield": dividend_yield,
                     "option_type": option_type,
-                    "symbol": symbol
+                    "symbol": symbol,
+                    # Only MonteCarloInputs has these — getattr default handles
+                    # BlackScholes/BinomialTree inputs safely. Downstream output
+                    # validation needs this to know the standard "price >=
+                    # intrinsic value" no-arbitrage bound doesn't apply to
+                    # barrier options (knockout risk can legitimately price
+                    # them below vanilla intrinsic value).
+                    "barrier_type": getattr(inputs, "barrier_type", None),
+                    "asian_type": getattr(inputs, "asian_type", None)
                 },
                 "market_data_source": "live" if market_data.get("stock_data", {}).get("data_quality") else "fallback",
                 "data_timestamp": market_data.get("stock_data", {}).get("last_updated", "unknown")
             }
+
+            # Only MonteCarloResult has convergence_data (BlackScholes/BinomialTree don't)
+            convergence_data = getattr(result, "convergence_data", None)
+            if convergence_data:
+                formatted_result["convergence_data"] = convergence_data
             
             return formatted_result
         
@@ -827,6 +851,9 @@ class RouterAgent:
                     options_data = pd.concat([calls_df, puts_df], ignore_index=True)
                     # Add type column
                     options_data['type'] = ['call'] * len(calls_df) + ['put'] * len(puts_df)
+                    # Add the real expiration date so VolatilityAgent can compute
+                    # actual time-to-expiry per option instead of assuming 30 days
+                    options_data['expiration'] = market_data["options_data"].get("expiration")
             
             # Create volatility inputs
             vol_inputs = VolatilityInputs(
@@ -1144,7 +1171,9 @@ class RouterAgent:
                 context = {
                     "spot_price": final_result.get("inputs", {}).get("spot_price"),
                     "strike": final_result.get("inputs", {}).get("strike_price"),
-                    "option_type": final_result.get("inputs", {}).get("option_type")
+                    "option_type": final_result.get("inputs", {}).get("option_type"),
+                    "barrier_type": final_result.get("inputs", {}).get("barrier_type"),
+                    "asian_type": final_result.get("inputs", {}).get("asian_type")
                 }
             elif validation_type == "greeks":
                 result_to_validate = final_result.get("greeks", {})
@@ -1712,6 +1741,64 @@ class RouterAgent:
                         }
                     }
 
+            elif query_type == QueryType.GREEKS_ANALYSIS and final_result and "error" not in final_result:
+                # Reuses the same "greeks_chart" key/shape as OPTION_PRICING —
+                # _process_greeks_analysis's result carries the identical
+                # delta/gamma/theta/vega/rho shape under "greeks"
+                greeks = final_result.get("greeks", {})
+                if greeks:
+                    viz_data["greeks_chart"] = {
+                        "type": "radar",
+                        "data": {
+                            "labels": ["Delta", "Gamma", "Theta", "Vega", "Rho"],
+                            "values": [
+                                abs(greeks.get("delta", 0)),
+                                greeks.get("gamma", 0) * 10,
+                                abs(greeks.get("theta", 0)) * 10,
+                                greeks.get("vega", 0) / 100,
+                                abs(greeks.get("rho", 0)) / 100
+                            ]
+                        }
+                    }
+
+            elif query_type == QueryType.RISK_MANAGEMENT and final_result and "error" not in final_result:
+                # Prepare risk dashboard (VaR, portfolio Greeks, concentration)
+                risk_metrics = final_result.get("risk_metrics", {})
+                if risk_metrics:
+                    viz_data["risk_dashboard"] = {
+                        "type": "dashboard",
+                        "data": {
+                            "var_data": {
+                                "labels": ["1-Day VaR", "10-Day VaR"],
+                                "values": [
+                                    risk_metrics.get("var_1day", 0),
+                                    risk_metrics.get("var_10day", 0)
+                                ]
+                            },
+                            "greeks_data": {
+                                "labels": ["Delta", "Gamma", "Theta", "Vega"],
+                                "values": [
+                                    risk_metrics.get("total_delta", 0),
+                                    risk_metrics.get("total_gamma", 0),
+                                    risk_metrics.get("total_theta", 0),
+                                    risk_metrics.get("total_vega", 0)
+                                ]
+                            },
+                            "concentration": risk_metrics.get("concentration_risk", {})
+                        }
+                    }
+
+                # Prepare stress test results
+                stress_test_results = final_result.get("stress_test_results", {})
+                if stress_test_results:
+                    viz_data["stress_tests"] = {
+                        "type": "bar",
+                        "data": {
+                            "scenarios": list(stress_test_results.keys()),
+                            "pnl_impact": list(stress_test_results.values())
+                        }
+                    }
+
             logger.info(f"Prepared {len(viz_data)} visualization data sets")
             return viz_data
             
@@ -1810,7 +1897,7 @@ class RouterAgent:
             return {
                 "x": moneyness_labels,
                 "y": volatilities,
-                "title": "Implied Volatility Surface",
+                "title": "Implied Volatility Smile",
                 "ylabel": "Implied Volatility (%)"
             }
             

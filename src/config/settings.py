@@ -51,6 +51,21 @@ class Settings(BaseSettings):
     RISK_FREE_RATE_TICKER: str = "^TNX"
     DEFAULT_RISK_FREE_RATE: float = 0.05
 
+    # ── Options Liquidity Filter ───────────────────────────────────────
+    # An option quote is considered liquid enough to trust for implied
+    # volatility calculations if it meets EITHER threshold (not both) —
+    # a freshly-opened contract may have high volume but low open interest,
+    # while an established position may have the reverse.
+    MIN_OPTION_VOLUME: int = 1
+    MIN_OPTION_OPEN_INTEREST: int = 10
+
+    # Target horizon for volatility-analysis queries specifically — the
+    # options chain nearest to this many days out is used, rather than
+    # literally the next available expiration (which can be 1-2 DTE and
+    # produce a numerically unstable smile). 30 days matches the standard
+    # industry convention (e.g. VIX is a 30-day constant-maturity IV).
+    VOLATILITY_TARGET_DTE: int = 30
+
     # ── Risk Management ───────────────────────────────────────────────
     MAX_VOLATILITY: float = 3.0
     MIN_VOLATILITY: float = 0.01

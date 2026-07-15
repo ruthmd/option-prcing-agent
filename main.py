@@ -137,9 +137,11 @@ class OptionsAIAgentWithVisualization:
                     )
                 
                 if viz_data.get("volatility_surface"):
+                    # Note: this is a 2D volatility smile (avg IV by moneyness bucket),
+                    # not a true 3D strike x expiry surface — see create_volatility_surface()
                     charts["vol_surface"] = self.visualizer.create_volatility_surface(
                         viz_data,
-                        "Implied Volatility Surface"
+                        "Implied Volatility Smile"
                     )
             
             # Strategy analysis charts

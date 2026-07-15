@@ -24,11 +24,16 @@ class VolatilityInputs(BaseModel):
 
 class VolatilityResult(BaseModel):
    """Result of volatility analysis"""
-   historical_volatility: Dict[str, float]
+   # These are typed as Dict[str, Any] rather than Dict[str, float] because
+   # their source methods legitimately mix numeric values with string fields
+   # (e.g. garch_forecast's "forecast_method") or string error messages on
+   # failure paths (e.g. {"error": "..."}) — a strict float-only type would
+   # fail Pydantic validation on those valid, expected shapes.
+   historical_volatility: Dict[str, Any]
    implied_volatility: Dict[str, Any]
    volatility_surface: Optional[Dict[str, Any]] = None
-   volatility_statistics: Dict[str, float]
-   garch_forecast: Optional[Dict[str, float]] = None
+   volatility_statistics: Dict[str, Any]
+   garch_forecast: Optional[Dict[str, Any]] = None
    regime_analysis: Dict[str, Any]
    inputs: VolatilityInputs
 
@@ -166,15 +171,53 @@ class VolatilityAgent:
                try:
                    # Extract option details
                    strike = float(option.get('strike', 0))
-                   market_price = float(option.get('lastPrice', option.get('mid_price', 0)))
+
+                   # Prefer the live bid/ask midpoint over lastPrice. lastPrice
+                   # is whenever the last trade happened — which can be stale
+                   # by hours (or the whole session) for a contract that
+                   # doesn't trade every minute, even one with decent volume/OI
+                   # on the day — while mid_price reflects the current market.
+                   mid_price = option.get('mid_price', 0)
+                   last_price = option.get('lastPrice', 0)
+                   mid_price = 0 if pd.isna(mid_price) else mid_price
+                   last_price = 0 if pd.isna(last_price) else last_price
+                   market_price = float(mid_price) if mid_price > 0 else float(last_price)
+
                    option_type = option.get('type', 'call').lower()
                    
                    if strike <= 0 or market_price <= 0:
                        continue
-                   
-                   # Calculate time to expiry (simplified - would need actual expiry date)
-                   # For now, assume 30 days as placeholder
-                   time_to_expiry = 30 / 365
+
+                   # Skip illiquid quotes. Thin/no trading activity often means
+                   # a stale lastPrice that doesn't reflect a real tradeable
+                   # market, which back-solves into noisy, unstable implied
+                   # volatility even once the expiration mismatch is fixed
+                   # (this is what was still inflating the mean IV from a
+                   # handful of extreme strikes after that earlier fix).
+                   volume = option.get('volume', 0)
+                   open_interest = option.get('openInterest', 0)
+                   volume = 0 if pd.isna(volume) else volume
+                   open_interest = 0 if pd.isna(open_interest) else open_interest
+
+                   if volume < settings.MIN_OPTION_VOLUME and open_interest < settings.MIN_OPTION_OPEN_INTEREST:
+                       continue
+
+                   # Use the option's actual expiration date when available. A
+                   # wrong assumption here (e.g. a fixed 30 days) can badly
+                   # mismatch the option's real time value — for a near-dated
+                   # chain especially, this makes the IV solver unable to
+                   # bracket a root for most strikes since no volatility can
+                   # reconcile a 30-day time-value assumption with a market
+                   # price reflecting only a few days of time value.
+                   expiration_str = option.get('expiration')
+                   time_to_expiry = 30 / 365  # fallback if expiration is missing/unparseable
+                   if expiration_str:
+                       try:
+                           expiry_date = datetime.strptime(str(expiration_str), '%Y-%m-%d')
+                           days_to_expiry = (expiry_date - datetime.now()).days
+                           time_to_expiry = max(days_to_expiry, 1) / 365
+                       except ValueError:
+                           pass
                    
                    # Calculate implied volatility
                    implied_vol = self.bs_agent.calculate_implied_volatility(
@@ -652,7 +695,7 @@ if __name__ == "__main__":
                print(f"  {key.replace('_', ' ').title()}: {value}")
    
    if result.volatility_surface:
-       print("\nVolatility Surface:")
+       print("\nVolatility Smile (by moneyness bucket):")
        if "surface_by_moneyness" in result.volatility_surface:
            for moneyness, data in result.volatility_surface["surface_by_moneyness"].items():
                print(f"  {moneyness.replace('_', ' ').title()}: {data['avg_implied_vol']:.2%} ({data['count']} options)")

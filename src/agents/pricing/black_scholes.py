@@ -229,7 +229,7 @@ class BlackScholesPricingAgent:
             implied_vol = brentq(
                 objective_function,
                 a=0.001,  # 0.1% minimum volatility
-                b=5.0,    # 500% maximum volatility
+                b=3.0,    # 300% maximum volatility — must match BlackScholesInputs.volatility's le=3.0 bound
                 xtol=1e-6,
                 maxiter=100
             )

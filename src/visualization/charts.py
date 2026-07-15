@@ -210,11 +210,17 @@ class OptionsVisualization:
             return self._create_empty_chart(f"Error creating volatility chart: {str(e)}")
     
     def create_volatility_surface(
-        self, 
+        self,
         viz_data: Dict[str, Any],
-        title: str = "Implied Volatility Surface"
+        title: str = "Implied Volatility Smile"
     ) -> go.Figure:
-        """Create volatility surface visualization"""
+        """Create a 2D implied volatility smile chart (avg IV by moneyness bucket).
+
+        Despite the method name, this is NOT a true 3D volatility surface —
+        there's no time-to-expiry axis, since the underlying data only covers
+        a single expiration. A real strike x expiry surface would need
+        multi-expiration data and a go.Surface/go.Mesh3d plot instead.
+        """
         try:
             if "volatility_surface" not in viz_data:
                 return self._create_empty_chart("No volatility surface data available")
