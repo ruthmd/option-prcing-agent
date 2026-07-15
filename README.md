@@ -32,7 +32,7 @@ An agentic AI system for options trading analysis with built-in guardrails and g
 - **Volatility Analysis Agent**
   - **Role:** Volatility specialist
   - **Goal:** Analyze implied/historical volatility
-  - **Tools:** Volatility surface modeling, IV calculations
+  - **Tools:** Volatility smile modeling (by moneyness bucket), IV calculations
 
 - **Strategy Analysis Agent**
   - **Role:** Options strategy expert
@@ -106,7 +106,7 @@ No charts are generated in this mode by default.
 
 ### Query with visualizations
 
-Add `--viz` to generate charts (payoff diagrams, Greeks radar, volatility surfaces, etc.) and open a dashboard in the browser:
+Add `--viz` to generate charts (payoff diagrams, Greeks radar, volatility smile, etc.) and open a dashboard in the browser:
 
 ```bash
 python main.py --query 'Analyze an iron condor strategy on SPY expiring in 45 days' --viz
