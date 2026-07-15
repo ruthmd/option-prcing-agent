@@ -4,3 +4,4 @@ outputs/
 data/knowledge_base/
 visualizations/
 **/__pycache__/
+venv/
