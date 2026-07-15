@@ -4,7 +4,10 @@ import re
 # Options Domain Keywords
 OPTIONS_KEYWORDS = {
     'basic_terms': {
-        'call', 'put', 'option', 'strike', 'expiry', 'expiration', 'premium', 
+        # 'expir' is a root, not a full word — substring matching (see
+        # InputValidator._calculate_domain_relevance) means it also covers
+        # "expiry", "expiring", "expires", "expiration" without listing each.
+        'call', 'put', 'option', 'strike', 'expir', 'premium',
         'exercise', 'assignment', 'intrinsic', 'extrinsic', 'time value'
     },
     'pricing_models': {
@@ -16,8 +19,16 @@ OPTIONS_KEYWORDS = {
         'volga', 'speed', 'zomma'
     },
     'strategies': {
-        'straddle', 'strangle', 'spread', 'butterfly', 'condor', 'collar',
-        'covered call', 'protective put', 'iron condor', 'calendar spread'
+        # 'strateg' root covers "strategy"/"strategies"/"strategic".
+        # Full list matches every StrategyType the strategy agent supports,
+        # not just the ones that happened to be here before.
+        'strateg', 'straddle', 'strangle', 'spread', 'butterfly', 'condor', 'collar',
+        'long call', 'short call', 'long put', 'short put',
+        'covered call', 'protective put',
+        'bull call spread', 'bear put spread',
+        'long straddle', 'short straddle', 'long strangle', 'short strangle',
+        'iron condor', 'iron butterfly', 'long butterfly', 'short butterfly',
+        'calendar spread'
     },
     'risk_terms': {
         'volatility', 'implied volatility', 'historical volatility', 'skew',

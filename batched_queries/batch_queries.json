@@ -1,0 +1,40 @@
+[
+  "Price a call option on AAPL with strike $150, expiring in 30 days",
+  "Price a put option on MSFT with strike $400, expiring in 45 days",
+  "Price an American put option on SPY strike $420, expiring in 60 days",
+  "Price a European call option on ^GSPC strike $4500, expiring in 60 days",
+  "Price an American barrier up-and-out call option on TSLA strike $200, expiring in 60 days",
+  "Price an Asian call option on GOOGL strike $140, expiring in 60 days",
+
+  "Calculate Greeks for GOOGL put option strike $140, expiring in 30 days",
+  "What are the Greeks for a NVDA call option strike $800, expiring in 45 days?",
+
+  "Analyze historical volatility for TSLA over 60 days",
+  "Calculate implied volatility for AAPL options",
+  "Analyze volatility surface for SPY options",
+
+  "Analyze a long call strategy on AAPL strike $150 expiring in 30 days",
+  "Analyze a short put strategy on SPY strike $420 expiring in 30 days",
+  "Analyze a covered call strategy on MSFT strike $400 expiring in 45 days",
+  "Analyze a protective put strategy on TSLA strike $180 expiring in 30 days",
+  "Analyze a bull call spread on AAPL expiring in 45 days",
+  "Analyze a bear put spread on NVDA expiring in 45 days",
+  "Analyze a long straddle strategy on TSLA expiring in 30 days",
+  "Analyze a short straddle strategy on SPY expiring in 30 days",
+  "Analyze a long strangle strategy on GOOGL expiring in 30 days",
+  "Analyze a short strangle strategy on QQQ expiring in 30 days",
+  "Analyze an iron condor strategy on SPY expiring in 45 days",
+  "Analyze an iron butterfly strategy on AAPL expiring in 30 days",
+  "Analyze a long butterfly strategy on MSFT expiring in 30 days",
+  "Analyze a short butterfly strategy on GOOGL expiring in 30 days",
+  "Analyze a collar strategy on TSLA strike $200 expiring in 45 days",
+  "Analyze a calendar spread strategy on AAPL expiring in 60 days",
+
+  "Calculate portfolio risk and suggest hedges",
+  "Calculate VaR for my options portfolio",
+
+  "What is put-call parity?",
+  "Explain delta hedging",
+  "How does Black-Scholes work?",
+  "What is the difference between American and European options?"
+]

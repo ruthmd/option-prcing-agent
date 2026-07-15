@@ -29,6 +29,8 @@ class MonteCarloInputs(BaseModel):
 class MonteCarloResult(BaseModel):
     """Result of Monte Carlo simulation"""
     option_price: float
+    intrinsic_value: float
+    time_value: float
     standard_error: float
     confidence_interval: Tuple[float, float]
     convergence_data: Dict[str, List[float]]
@@ -47,33 +49,22 @@ class MonteCarloPricingAgent:
     def calculate_option_price(self, inputs: MonteCarloInputs) -> MonteCarloResult:
         """Calculate option price using Monte Carlo simulation"""
         try:
-            # Validate inputs
-            self._validate_inputs(inputs)
-            
-            # Set random seed if provided
-            if inputs.random_seed is not None:
-                np.random.seed(inputs.random_seed)
-            
-            # Generate price paths
-            price_paths = self._generate_price_paths(inputs)
-            
-            # Calculate payoffs based on option type
-            payoffs = self._calculate_payoffs(inputs, price_paths)
-            
-            # Calculate option price and statistics
-            option_price, std_error, confidence_interval = self._calculate_price_and_stats(payoffs, inputs)
-            
-            # Calculate convergence data
-            convergence_data = self._analyze_convergence(payoffs)
-            
-            # Calculate path statistics
-            path_stats = self._calculate_path_statistics(price_paths)
-            
-            # Calculate Greeks using finite differences
+            option_price, std_error, confidence_interval, convergence_data, path_stats = self._price_core(inputs)
+
+            # Calculate Greeks using finite differences (does NOT recurse back
+            # into this method — it reprices via _price_only to avoid
+            # unbounded recursion through repeated Greeks calculation)
             greeks = self._calculate_greeks(inputs)
-            
+
+            if inputs.option_type.lower() == "call":
+                intrinsic_value = max(0, inputs.spot_price - inputs.strike_price)
+            else:
+                intrinsic_value = max(0, inputs.strike_price - inputs.spot_price)
+
             result = MonteCarloResult(
                 option_price=round(option_price, 4),
+                intrinsic_value=round(intrinsic_value, 4),
+                time_value=round(option_price - intrinsic_value, 4),
                 standard_error=round(std_error, 6),
                 confidence_interval=(round(confidence_interval[0], 4), round(confidence_interval[1], 4)),
                 convergence_data=convergence_data,
@@ -81,14 +72,34 @@ class MonteCarloPricingAgent:
                 greeks=greeks,
                 inputs=inputs
             )
-            
+
             logger.debug(f"Monte Carlo calculation completed: {inputs.option_type} price = {option_price:.4f} ± {std_error:.4f}")
             return result
-            
+
         except Exception as e:
             logger.error(f"Monte Carlo calculation failed: {e}")
             raise ValueError(f"Monte Carlo calculation error: {str(e)}")
-    
+
+    def _price_core(self, inputs: MonteCarloInputs):
+        """Core simulation pricing, with no Greeks computation — safe to call repeatedly for bumped inputs"""
+        self._validate_inputs(inputs)
+
+        if inputs.random_seed is not None:
+            np.random.seed(inputs.random_seed)
+
+        price_paths = self._generate_price_paths(inputs)
+        payoffs = self._calculate_payoffs(inputs, price_paths)
+        option_price, std_error, confidence_interval = self._calculate_price_and_stats(payoffs, inputs)
+        convergence_data = self._analyze_convergence(payoffs)
+        path_stats = self._calculate_path_statistics(price_paths)
+
+        return option_price, std_error, confidence_interval, convergence_data, path_stats
+
+    def _price_only(self, inputs: MonteCarloInputs) -> float:
+        """Price-only helper for Greeks finite-differencing — never touches Greeks"""
+        option_price, _, _, _, _ = self._price_core(inputs)
+        return option_price
+
     def _validate_inputs(self, inputs: MonteCarloInputs):
         """Validate input parameters"""
         if inputs.spot_price <= 0:
@@ -304,44 +315,44 @@ class MonteCarloPricingAgent:
     def _calculate_greeks(self, inputs: MonteCarloInputs) -> Dict[str, float]:
         """Calculate Greeks using finite differences"""
         try:
-            base_price = self.calculate_option_price(inputs).option_price
-            
+            base_price = self._price_only(inputs)
+
             # Delta
             spot_shift = inputs.spot_price * 0.01
             inputs_up = inputs.copy()
             inputs_up.spot_price = inputs.spot_price + spot_shift
             inputs_down = inputs.copy()
             inputs_down.spot_price = inputs.spot_price - spot_shift
-            
-            price_up = self.calculate_option_price(inputs_up).option_price
-            price_down = self.calculate_option_price(inputs_down).option_price
+
+            price_up = self._price_only(inputs_up)
+            price_down = self._price_only(inputs_down)
             delta = (price_up - price_down) / (2 * spot_shift)
-            
+
             # Gamma
             gamma = (price_up - 2 * base_price + price_down) / (spot_shift ** 2)
-            
+
             # Vega
             vol_shift = 0.01
             inputs_vega = inputs.copy()
             inputs_vega.volatility = inputs.volatility + vol_shift
-            price_vega = self.calculate_option_price(inputs_vega).option_price
+            price_vega = self._price_only(inputs_vega)
             vega = (price_vega - base_price) / vol_shift
-            
+
             # Theta
             time_shift = 1/365
             if inputs.time_to_expiry > time_shift:
                 inputs_theta = inputs.copy()
                 inputs_theta.time_to_expiry = inputs.time_to_expiry - time_shift
-                price_theta = self.calculate_option_price(inputs_theta).option_price
+                price_theta = self._price_only(inputs_theta)
                 theta = (price_theta - base_price) / time_shift
             else:
                 theta = 0.0
-            
+
             # Rho
             rate_shift = 0.01
             inputs_rho = inputs.copy()
             inputs_rho.risk_free_rate = inputs.risk_free_rate + rate_shift
-            price_rho = self.calculate_option_price(inputs_rho).option_price
+            price_rho = self._price_only(inputs_rho)
             rho = (price_rho - base_price) / rate_shift
             
             return {

@@ -244,6 +244,53 @@ class StrategyAnalysisAgent:
                 "volatility_bias": "negative",
                 "complexity": 3,
                 "time_decay": "mixed"
+            },
+            StrategyType.SHORT_BUTTERFLY: {
+                "legs": [
+                    {"option_type": "call", "position": "short", "quantity": 1, "strike_order": "lower"},
+                    {"option_type": "call", "position": "long", "quantity": 2, "strike_order": "middle"},
+                    {"option_type": "call", "position": "short", "quantity": 1, "strike_order": "higher"}
+                ],
+                "market_bias": "neutral",
+                "volatility_bias": "positive",
+                "complexity": 3,
+                "time_decay": "mixed"
+            },
+            StrategyType.SHORT_CALL: {
+                "legs": [{"option_type": "call", "position": "short", "quantity": 1}],
+                "market_bias": "bearish_to_neutral",
+                "volatility_bias": "negative",
+                "complexity": 1,
+                "time_decay": "positive"
+            },
+            StrategyType.SHORT_PUT: {
+                "legs": [{"option_type": "put", "position": "short", "quantity": 1}],
+                "market_bias": "bullish_to_neutral",
+                "volatility_bias": "negative",
+                "complexity": 1,
+                "time_decay": "positive"
+            },
+            StrategyType.CALENDAR_SPREAD: {
+                "legs": [
+                    {"option_type": "call", "position": "short", "quantity": 1},
+                    {"option_type": "call", "position": "long", "quantity": 1}
+                ],
+                "same_strike": True,
+                "market_bias": "neutral",
+                "volatility_bias": "positive",
+                "complexity": 3,
+                "time_decay": "positive"
+            },
+            StrategyType.COLLAR: {
+                "legs": [
+                    {"option_type": "put", "position": "long", "quantity": 1, "strike_order": "lower"},
+                    {"option_type": "call", "position": "short", "quantity": 1, "strike_order": "higher"}
+                ],
+                "stock_legs": [{"position": "long", "quantity": 100}],
+                "market_bias": "neutral_with_protection",
+                "volatility_bias": "negative",
+                "complexity": 3,
+                "time_decay": "mixed"
             }
         }
     
@@ -409,7 +456,7 @@ class StrategyAnalysisAgent:
             return assigned_strikes
         
         # Handle same strike requirement (straddles)
-        template_same_strike = any(leg_template.get("same_strike", False) for leg in leg_templates)
+        template_same_strike = any(leg.get("same_strike", False) for leg in leg_templates)
         if template_same_strike:
             return [strikes[0]] * len(leg_templates)
         

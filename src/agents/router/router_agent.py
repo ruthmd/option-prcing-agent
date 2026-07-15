@@ -2,17 +2,16 @@ from typing import Dict, List, Any, Optional, TypedDict, Annotated, Sequence
 from pydantic import BaseModel, Field
 from datetime import datetime
 import json
+import re
 from loguru import logger
 from enum import Enum
 
 from langgraph.graph import StateGraph, END
 # from langgraph.prebuilt import ToolExecutor
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_community.llms import HuggingFacePipeline
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-import torch
 import numpy as np
 
+from ...providers.factory import get_llm
 from ..grounding.input_validator import InputValidator, ValidationResult
 from ..grounding.knowledge_grounding import KnowledgeGroundingAgent, GroundingResult
 from ..grounding.output_validator import OutputValidator, OutputValidationResult
@@ -84,6 +83,8 @@ class RouterAgent:
         self.binomial_tree_agent = BinomialTreePricingAgent()
         self.monte_carlo_agent = MonteCarloPricingAgent()
         self.volatility_agent = VolatilityAgent()
+        self.strategy_agent = StrategyAnalysisAgent()
+        self.risk_management_agent = RiskManagementAgent()
         
         # Initialize LLM
         self.llm = self._initialize_llm()
@@ -94,47 +95,15 @@ class RouterAgent:
         logger.info("Router Agent initialized successfully")
     
     def _initialize_llm(self):
-        """Initialize the local LLM for text generation"""
+        """Initialize the LLM via the configured provider (LLM_PROVIDER=local|openai|claude)"""
         try:
-            logger.info(f"Loading LLM: {settings.HF_MODEL_NAME}")
-            
-            # Use a more suitable model for financial tasks
-            model_name = "microsoft/DialoGPT-medium"
-            
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
-            )
-            
-            # Create pipeline
-            pipe = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                max_length=512,
-                temperature=0.7,
-                do_sample=True,
-                device=0 if torch.cuda.is_available() else -1,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            
-            llm = HuggingFacePipeline(pipeline=pipe)
-            logger.success("LLM loaded successfully")
+            llm = get_llm("analysis")
+            logger.success(f"LLM provider '{settings.LLM_PROVIDER}' initialized successfully")
             return llm
-            
+
         except Exception as e:
-            logger.error(f"Failed to load LLM: {e}")
-            logger.info("Using fallback text generation")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to load LLM: {e}")
-            logger.info("Using fallback text generation")
+            logger.error(f"Failed to initialize LLM provider '{settings.LLM_PROVIDER}': {e}")
+            logger.info("Falling back to template-based responses (no LLM)")
             return None
     
     def _build_workflow(self) -> StateGraph:
@@ -150,6 +119,7 @@ class RouterAgent:
         workflow.add_node("route_to_specialist", self._route_to_specialist_node)
         workflow.add_node("validate_output", self._validate_output_node)
         workflow.add_node("generate_response", self._generate_response_node)
+        workflow.add_node("judge_response", self._judge_response_node)
         
         # Define the workflow edges
         workflow.set_entry_point("validate_input")
@@ -160,7 +130,8 @@ class RouterAgent:
         workflow.add_edge("fetch_market_data", "route_to_specialist")
         workflow.add_edge("route_to_specialist", "validate_output")
         workflow.add_edge("validate_output", "generate_response")
-        workflow.add_edge("generate_response", END)
+        workflow.add_edge("generate_response", "judge_response")
+        workflow.add_edge("judge_response", END)
         
         return workflow.compile()
     
@@ -479,21 +450,33 @@ class RouterAgent:
         """Extract appropriate strikes for strategy"""
         if "strikes" in parsed_params and parsed_params["strikes"]:
             return parsed_params["strikes"]
-        # Generate default strikes based on strategy type
+
+        # Anchor default strike generation on the user-specified strike when
+        # present, falling back to spot price (ATM) otherwise. This used to
+        # check parsed_params["strikes"] (plural) only, which InputValidator
+        # never sets — it only ever produces "strike" (singular) — so a
+        # user-specified strike was silently discarded for every strategy query.
+        anchor = parsed_params.get("strike", spot_price)
+
+        # Generate default strikes based on strategy type, anchored around `anchor`
         if strategy_type in [StrategyType.LONG_STRADDLE, StrategyType.SHORT_STRADDLE]:
-            return [spot_price]  # ATM straddle
+            return [anchor]  # ATM straddle
         elif strategy_type in [StrategyType.LONG_STRANGLE, StrategyType.SHORT_STRANGLE]:
-            return [spot_price * 0.95, spot_price * 1.05]  # 5% OTM strangle
+            return [anchor * 0.95, anchor * 1.05]  # 5% OTM strangle
         elif strategy_type == StrategyType.IRON_CONDOR:
-            return [spot_price * 0.90, spot_price * 0.95, spot_price * 1.05, spot_price * 1.10]  # Iron condor strikes
+            return [anchor * 0.90, anchor * 0.95, anchor * 1.05, anchor * 1.10]  # Iron condor strikes
         elif strategy_type == StrategyType.BULL_CALL_SPREAD:
-            return [spot_price * 0.98, spot_price * 1.05]  # Bull call spread
+            return [anchor * 0.98, anchor * 1.05]  # Bull call spread
         elif strategy_type == StrategyType.BEAR_PUT_SPREAD:
-            return [spot_price * 1.02, spot_price * 0.95]  # Bear put spread
-        elif strategy_type in [StrategyType.LONG_BUTTERFLY, StrategyType.IRON_BUTTERFLY]:
-            return [spot_price * 0.95, spot_price, spot_price * 1.05]  # Butterfly strikes
+            return [anchor * 1.02, anchor * 0.95]  # Bear put spread
+        elif strategy_type in [StrategyType.LONG_BUTTERFLY, StrategyType.SHORT_BUTTERFLY, StrategyType.IRON_BUTTERFLY]:
+            return [anchor * 0.95, anchor, anchor * 1.05]  # Butterfly strikes
+        elif strategy_type == StrategyType.COLLAR:
+            return [anchor * 0.95, anchor * 1.05]  # protective put (lower), covered call (higher)
+        elif strategy_type == StrategyType.CALENDAR_SPREAD:
+            return [anchor]  # same strike, both legs
         else:
-            return [spot_price]  # Default to ATM
+            return [anchor]  # single-leg strategies (long/short call/put, covered call, protective put)
     
 
     def _identify_strategy_type(self, query: str) -> Optional[StrategyType]:
@@ -501,6 +484,8 @@ class RouterAgent:
         strategy_keywords = {
             "long call": StrategyType.LONG_CALL,
             "long put": StrategyType.LONG_PUT,
+            "short call": StrategyType.SHORT_CALL,
+            "short put": StrategyType.SHORT_PUT,
             "covered call": StrategyType.COVERED_CALL,
             "protective put": StrategyType.PROTECTIVE_PUT,
             "bull call spread": StrategyType.BULL_CALL_SPREAD,
@@ -512,6 +497,9 @@ class RouterAgent:
             "iron condor": StrategyType.IRON_CONDOR,
             "iron butterfly": StrategyType.IRON_BUTTERFLY,
             "long butterfly": StrategyType.LONG_BUTTERFLY,
+            "short butterfly": StrategyType.SHORT_BUTTERFLY,
+            "calendar spread": StrategyType.CALENDAR_SPREAD,
+            "collar": StrategyType.COLLAR,
             "straddle": StrategyType.LONG_STRADDLE,  # Default to long
             "strangle": StrategyType.LONG_STRANGLE,  # Default to long
             "butterfly": StrategyType.LONG_BUTTERFLY,  # Default to long
@@ -662,24 +650,25 @@ class RouterAgent:
             # Log all inputs after validation
             logger.info(f"Validated option pricing inputs: {symbol} S=${spot_price:.2f}, K=${strike:.2f}, T={time_to_expiry:.4f}, r={risk_free_rate:.4f}, σ={volatility:.4f}, q={dividend_yield:.4f}, type={option_type}")
             
-            # Determine which pricing method to use
+            # Determine exercise style: explicit query keyword overrides an inference
+            # from the underlying's quoteType (index options are conventionally
+            # European-style regardless of country; single-stock/ETF options are
+            # conventionally American-style regardless of country).
+            quote_type = market_data.get("stock_data", {}).get("quote_type", "EQUITY")
+
             if any(word in query for word in ["american", "early exercise"]):
-                # Use binomial tree for American options
-                inputs = BinomialTreeInputs(
-                    spot_price=spot_price,
-                    strike_price=strike,
-                    time_to_expiry=time_to_expiry,
-                    risk_free_rate=risk_free_rate,
-                    volatility=volatility,
-                    dividend_yield=dividend_yield,
-                    option_type=option_type,
-                    option_style="american",
-                    steps=100
-                )
-                result = self.binomial_tree_agent.calculate_option_price(inputs)
-                method = "Binomial Tree (American)"
-                
-            elif any(word in query for word in ["barrier", "asian", "exotic"]):
+                exercise_style, style_source = "american", "explicit (query)"
+            elif "european" in query:
+                exercise_style, style_source = "european", "explicit (query)"
+            elif quote_type == "INDEX":
+                exercise_style, style_source = "european", f"inferred (quoteType={quote_type})"
+            else:
+                exercise_style, style_source = "american", f"inferred (quoteType={quote_type})"
+
+            logger.info(f"Exercise style: {exercise_style} [{style_source}]")
+
+            # Determine which pricing method to use
+            if any(word in query for word in ["barrier", "asian", "exotic"]):
                 # Use Monte Carlo for exotic options
                 inputs = MonteCarloInputs(
                     spot_price=spot_price,
@@ -708,9 +697,25 @@ class RouterAgent:
                 
                 result = self.monte_carlo_agent.calculate_option_price(inputs)
                 method = "Monte Carlo Simulation"
-                
+
+            elif exercise_style == "american":
+                # Binomial tree for American-style exercise
+                inputs = BinomialTreeInputs(
+                    spot_price=spot_price,
+                    strike_price=strike,
+                    time_to_expiry=time_to_expiry,
+                    risk_free_rate=risk_free_rate,
+                    volatility=volatility,
+                    dividend_yield=dividend_yield,
+                    option_type=option_type,
+                    option_style="american",
+                    steps=100
+                )
+                result = self.binomial_tree_agent.calculate_option_price(inputs)
+                method = f"Binomial Tree (American, {style_source})"
+
             else:
-                # Use Black-Scholes for European options
+                # Black-Scholes for European-style exercise
                 inputs = BlackScholesInputs(
                     spot_price=spot_price,
                     strike_price=strike,
@@ -721,7 +726,7 @@ class RouterAgent:
                     option_type=option_type
                 )
                 result = self.black_scholes_agent.calculate_option_price(inputs)
-                method = "Black-Scholes-Merton"
+                method = f"Black-Scholes-Merton (European, {style_source})"
             
             logger.info(f"Option pricing completed using {method}: ${result.option_price:.4f}")
             
@@ -930,7 +935,8 @@ class RouterAgent:
                 "complexity_rating": result.complexity_rating,
                 "risk_warnings": result.risk_warnings,
                 "management_guidelines": result.management_guidelines,
-                "payoff_data": result.payoff_data
+                "payoff_data": result.payoff_data,
+                "price_range": result.price_range
             }
             
         except Exception as e:
@@ -1204,11 +1210,15 @@ class RouterAgent:
             
             # Build response message
             response_parts = []
-            
+
             # Add main result
             if final_result and "error" not in final_result:
-                response_parts.append(self._format_result_for_response(final_result, query_type))
-            
+                formatted_result = self._format_result_for_response(final_result, query_type)
+                narrative = self._generate_llm_narrative(
+                    state["user_query"], query_type, formatted_result, final_result
+                )
+                response_parts.append(narrative or formatted_result)
+
             # Add validation summary if available
             if output_validation:
                 response_parts.append(self._format_validation_summary(output_validation))
@@ -1243,9 +1253,160 @@ class RouterAgent:
         except Exception as e:
             logger.error(f"Response generation failed: {e}")
             state["response_message"] = f"Error generating response: {str(e)}"
-        
+
         return state
-    
+
+    def _generate_llm_narrative(
+        self,
+        user_query: str,
+        query_type: "QueryType",
+        formatted_result: str,
+        final_result: Dict[str, Any]
+    ) -> Optional[str]:
+        """Ask the configured LLM to explain the already-computed result in plain language.
+
+        The LLM never computes numbers itself — it only narrates the deterministic
+        output from the pricing/strategy/risk agents, so a bad LLM response can't
+        corrupt the underlying math.
+        """
+        if not self.llm:
+            return None
+
+        try:
+            system_prompt = (
+                "You are an options trading analyst assistant. You will be given the user's "
+                "question and a pre-computed, verified result. Rewrite it as a clear, concise "
+                "explanation for the user. Do NOT invent, recompute, or alter any numbers — "
+                "use only the figures provided. Do not add new disclaimers; those are appended "
+                "separately."
+            )
+            human_prompt = (
+                f"User question: {user_query}\n\n"
+                f"Query type: {query_type.value}\n\n"
+                f"Computed result (ground truth, do not alter numbers):\n{formatted_result}\n\n"
+                f"Raw structured data:\n{json.dumps(final_result, default=str)[:3000]}"
+            )
+
+            response = self.llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=human_prompt)
+            ])
+
+            content = getattr(response, "content", None) or str(response)
+            return content.strip() or None
+
+        except Exception as e:
+            logger.error(f"LLM narrative generation failed, falling back to template: {e}")
+            return None
+
+    def _judge_response_node(self, state: AgentState) -> AgentState:
+        """Independent cross-provider check on educational/low-confidence responses.
+
+        Uses the LLM_JUDGE provider (independent of LLM_PROVIDER, which generated
+        the response) to judge whether the response is consistent with established
+        options theory. Runs only for educational queries or when grounding
+        confidence is already low — running it on every routine pricing query would
+        add cost/latency for cases where there's little to hallucinate (a
+        Black-Scholes number is just a number). Set LLM_JUDGE=none to disable
+        entirely. Skips silently (no pipeline failure) on any provider/config error.
+        """
+        try:
+            if settings.LLM_JUDGE.lower() == "none":
+                logger.info("LLM-as-judge: disabled (LLM_JUDGE=none)")
+                return state
+
+            query_type = state["query_type"]
+            confidence = state.get("confidence_score", 1.0)
+            should_judge = (
+                query_type == QueryType.EDUCATIONAL or confidence < settings.CONFIDENCE_THRESHOLD
+            )
+
+            if not should_judge or not state.get("response_message"):
+                logger.debug(
+                    f"LLM-as-judge: not triggered (query_type={query_type.value}, "
+                    f"confidence={confidence:.2f}, threshold={settings.CONFIDENCE_THRESHOLD})"
+                )
+                return state
+
+            if settings.LLM_JUDGE.lower() == settings.LLM_PROVIDER.lower():
+                logger.debug(
+                    f"LLM_JUDGE and LLM_PROVIDER are both '{settings.LLM_PROVIDER}' — "
+                    "the judge won't be independent of the model that generated the response"
+                )
+
+            logger.info(
+                f"LLM-as-judge: triggered (query_type={query_type.value}, "
+                f"confidence={confidence:.2f}) — checking with provider='{settings.LLM_JUDGE}'"
+            )
+
+            grounding = state.get("knowledge_grounding")
+            grounding_context = "\n".join(
+                item["content"] for item in (grounding.retrieved_knowledge if grounding else [])
+            ) or "No supporting reference material was retrieved for this query."
+
+            verdict = self._run_llm_judge(state["user_query"], state["response_message"], grounding_context)
+
+            if verdict:
+                state["judge_verdict"] = verdict
+                logger.info(
+                    f"LLM-as-judge: provider='{settings.LLM_JUDGE}' verdict — "
+                    f"grounded={verdict.get('grounded')}, confidence={verdict.get('confidence', 0):.2f}, "
+                    f"concerns={len(verdict.get('concerns', []))}"
+                )
+                if not verdict.get("grounded", True) or verdict.get("concerns"):
+                    review_lines = [
+                        "",
+                        f"🔍 Independent Review ({settings.LLM_JUDGE}, confidence: {verdict.get('confidence', 0):.0%}):"
+                    ]
+                    for concern in verdict.get("concerns", []):
+                        review_lines.append(f"• {concern}")
+                    state["response_message"] += "\n" + "\n".join(review_lines)
+            else:
+                logger.warning(f"LLM-as-judge: provider='{settings.LLM_JUDGE}' returned no verdict (see prior warning for cause)")
+
+            state["processing_steps"].append("LLM-as-judge review completed")
+
+        except Exception as e:
+            logger.warning(f"LLM-as-judge review failed (provider='{settings.LLM_JUDGE}'), continuing without it: {e}")
+
+        return state
+
+    def _run_llm_judge(self, query: str, response_text: str, grounding_context: str) -> Optional[Dict[str, Any]]:
+        """Ask the configured LLM_JUDGE provider to fact-check the response against known theory"""
+        try:
+            judge_llm = get_llm("validation", provider_name=settings.LLM_JUDGE)
+
+            system_prompt = (
+                "You are an independent fact-checker for an options-trading assistant. "
+                "You did NOT write the response being checked. Compare it only against "
+                "the reference material provided and well-established options theory. "
+                "Respond with ONLY a JSON object, no other text, matching exactly: "
+                '{"grounded": <bool>, "confidence": <float 0-1>, "concerns": [<string>, ...]}. '
+                "\"concerns\" should be empty if you find no issues."
+            )
+            human_prompt = (
+                f"User question: {query}\n\n"
+                f"Reference material:\n{grounding_context}\n\n"
+                f"Response to check:\n{response_text}"
+            )
+
+            result = judge_llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=human_prompt)
+            ])
+
+            content = getattr(result, "content", None) or str(result)
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if not match:
+                logger.warning(f"LLM judge (provider='{settings.LLM_JUDGE}') did not return parseable JSON: {content[:200]}")
+                return None
+
+            return json.loads(match.group(0))
+
+        except Exception as e:
+            logger.warning(f"LLM judge call failed (provider='{settings.LLM_JUDGE}'): {e}")
+            return None
+
     # def _format_result_for_response(self, result: Dict[str, Any], query_type: QueryType) -> str:
     #     """Format result based on query type"""
         
@@ -1515,7 +1676,42 @@ class RouterAgent:
                 # Prepare volatility surface if available
                 if "volatility_surface" in final_result:
                     viz_data["volatility_surface"] = self._generate_volatility_surface_data(final_result)
-            
+
+            elif query_type == QueryType.STRATEGY_ANALYSIS and final_result and "error" not in final_result:
+                # Prepare strategy payoff diagram data
+                payoff_data = final_result.get("payoff_data")
+                price_range = final_result.get("price_range")
+                if payoff_data and price_range:
+                    viz_data["strategy_payoff"] = {
+                        "type": "line",
+                        "data": {
+                            "x": price_range,
+                            "y": payoff_data.get("total_payoff", []),
+                            "strategy_name": final_result.get("strategy_name", "Strategy"),
+                            "breakeven_points": final_result.get("breakeven_points", [])
+                        }
+                    }
+
+                # Prepare portfolio Greeks radar chart data (reuses the same
+                # "greeks_chart" key/shape as OPTION_PRICING — main.py's chart
+                # generation checks for this key unconditionally, regardless of
+                # query type)
+                portfolio_greeks = final_result.get("portfolio_greeks")
+                if portfolio_greeks:
+                    viz_data["greeks_chart"] = {
+                        "type": "radar",
+                        "data": {
+                            "labels": ["Delta", "Gamma", "Theta", "Vega", "Rho"],
+                            "values": [
+                                abs(portfolio_greeks.get("delta", 0)),
+                                portfolio_greeks.get("gamma", 0) * 10,
+                                abs(portfolio_greeks.get("theta", 0)) * 10,
+                                portfolio_greeks.get("vega", 0) / 100,
+                                abs(portfolio_greeks.get("rho", 0)) / 100
+                            ]
+                        }
+                    }
+
             logger.info(f"Prepared {len(viz_data)} visualization data sets")
             return viz_data
             
