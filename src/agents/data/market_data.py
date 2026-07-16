@@ -324,13 +324,10 @@ class MarketDataAgent:
                 puts = option_chain.puts
                 
                 # Clean and enhance the data
+                spot_price = ticker.history(period="1d")['Close'].iloc[-1]
                 for df in [calls, puts]:
-                    if not df.empty:
-                        # Add derived columns
-                        df['mid_price'] = (df['bid'] + df['ask']) / 2
-                        df['bid_ask_spread'] = df['ask'] - df['bid']
-                        df['moneyness'] = df['strike'] / ticker.history(period="1d")['Close'].iloc[-1]
-                
+                    self._enrich_option_chain_df(df, spot_price)
+
                 data = {
                     "symbol": symbol,
                     "expiration": target_expiration,
@@ -363,7 +360,126 @@ class MarketDataAgent:
                 success=False,
                 error_message=f"Failed to fetch options chain: {str(e)}"
             )
-    
+
+    def _enrich_option_chain_df(self, df: pd.DataFrame, spot_price: float) -> None:
+        """Add derived columns (mid_price, bid_ask_spread, moneyness) to an option chain DataFrame in place"""
+        if df.empty:
+            return
+        df['mid_price'] = (df['bid'] + df['ask']) / 2
+        df['bid_ask_spread'] = df['ask'] - df['bid']
+        df['moneyness'] = df['strike'] / spot_price
+
+    def get_options_chain_multi_expiry(
+        self,
+        symbol: str,
+        max_expirations: int = settings.VOL_SURFACE_MAX_EXPIRATIONS
+    ) -> MarketDataResult:
+        """Get options chains across several near-term expirations, for building
+        an IV term structure or a strike/moneyness x expiry volatility surface.
+
+        Bounded to `max_expirations` near-term expirations rather than all
+        available ones, since each expiration is a separate rate-limited
+        yfinance call and some symbols have 15-20+ expirations out to LEAPs.
+        """
+        cache_key = f"options_multi_{symbol}_{max_expirations}"
+
+        if self._is_cache_valid(cache_key):
+            return MarketDataResult(
+                success=True,
+                data=self.cache[cache_key],
+                data_quality=0.8
+            )
+
+        try:
+            self._rate_limit()
+            ticker = yf.Ticker(symbol)
+
+            try:
+                expirations = ticker.options
+                if not expirations:
+                    return MarketDataResult(
+                        success=False,
+                        error_message=f"No options available for {symbol}"
+                    )
+            except Exception as e:
+                return MarketDataResult(
+                    success=False,
+                    error_message=f"Failed to get options expirations for {symbol}: {str(e)}"
+                )
+
+            # Same 0-DTE exclusion as get_options_chain: near-zero vega at
+            # expiration means bid-ask noise back-solves into nonsensical IV.
+            today = datetime.now().date()
+            future_expirations = [
+                exp for exp in expirations
+                if datetime.strptime(exp, '%Y-%m-%d').date() > today
+            ]
+            candidates = future_expirations if future_expirations else expirations
+            selected_expirations = sorted(candidates)[:max_expirations]
+
+            if len(selected_expirations) < 2:
+                return MarketDataResult(
+                    success=False,
+                    error_message=(
+                        f"Need at least 2 future expirations to build a volatility "
+                        f"surface/term structure for {symbol}, found {len(selected_expirations)}"
+                    )
+                )
+
+            spot_price = ticker.history(period="1d")['Close'].iloc[-1]
+
+            chains = {}
+            failed_expirations = []
+            for expiry in selected_expirations:
+                try:
+                    self._rate_limit()
+                    option_chain = ticker.option_chain(expiry)
+                    calls = option_chain.calls
+                    puts = option_chain.puts
+
+                    for df in [calls, puts]:
+                        self._enrich_option_chain_df(df, spot_price)
+                        if not df.empty:
+                            df['expiration'] = expiry
+
+                    chains[expiry] = {"calls": calls, "puts": puts}
+                except Exception as e:
+                    logger.warning(f"Failed to fetch options chain for {symbol} @ {expiry}: {e}")
+                    failed_expirations.append(expiry)
+
+            if len(chains) < 2:
+                return MarketDataResult(
+                    success=False,
+                    error_message=(
+                        f"Only {len(chains)} of {len(selected_expirations)} requested "
+                        f"expirations succeeded for {symbol}; need at least 2"
+                    )
+                )
+
+            data = {
+                "symbol": symbol,
+                "spot_price": spot_price,
+                "expirations_fetched": sorted(chains.keys()),
+                "expiration_dates": list(expirations),
+                "chains": chains
+            }
+
+            self.cache[cache_key] = data
+            self.cache_timestamps[cache_key] = datetime.now()
+
+            return MarketDataResult(
+                success=True,
+                data=data,
+                data_quality=0.85 if failed_expirations else 0.9
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to fetch multi-expiry options chain for {symbol}: {e}")
+            return MarketDataResult(
+                success=False,
+                error_message=f"Failed to fetch multi-expiry options chain: {str(e)}"
+            )
+
     def get_risk_free_rate(self) -> float:
         """Get current risk-free rate (10-year Treasury)"""
         

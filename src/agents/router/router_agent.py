@@ -148,7 +148,21 @@ class RouterAgent:
             state["processing_steps"].append("Input validation completed")
             
             if not validation_result.is_valid:
-                state["errors"].extend(validation_result.errors)
+                # A below-threshold domain-relevance score is a soft signal, not
+                # a hard rejection — _classify_query_node already treats anything
+                # >= 0.3 relevance as "low confidence but domain-relevant" and
+                # processes it normally. It belongs in warnings, not errors: the
+                # final success check in process_query() only excludes errors
+                # containing the word "validation", and this message doesn't,
+                # so leaving it in errors silently fails otherwise-successful
+                # in-domain queries (e.g. pure volatility queries) whenever the
+                # keyword-counting heuristic under-scores them.
+                out_of_domain_msg = ERROR_MESSAGES['out_of_domain']
+                if out_of_domain_msg in validation_result.errors:
+                    state["warnings"].append(out_of_domain_msg)
+                state["errors"].extend(
+                    e for e in validation_result.errors if e != out_of_domain_msg
+                )
                 state["confidence_score"] = validation_result.confidence
             else:
                 # Set initial confidence score from domain relevance
@@ -304,22 +318,25 @@ class RouterAgent:
                             market_data["volatility_data"] = vol_result.data
                             logger.info(f"Historical volatility for {symbol}: {vol_result.data['volatility']:.1%}")
                     
-                    # Get options chain if needed. Volatility analysis targets a
-                    # ~30-day horizon specifically (standard IV convention) rather
-                    # than just the nearest expiration — pricing/strategy/arbitrage
-                    # queries still get literally the nearest available contract,
-                    # since that's what a real trader looking at that option would
-                    # expect.
+                    # Get options chain if needed. Volatility analysis needs
+                    # several expirations at once (to build an IV term
+                    # structure / surface) rather than the single ~30-day
+                    # chain used before — pricing/strategy/arbitrage queries
+                    # still get literally the nearest available contract,
+                    # since that's what a real trader looking at that option
+                    # would expect.
                     if query_type in [QueryType.OPTION_PRICING, QueryType.STRATEGY_ANALYSIS, QueryType.ARBITRAGE_DETECTION, QueryType.VOLATILITY_ANALYSIS]:
                         if query_type == QueryType.VOLATILITY_ANALYSIS:
-                            options_result = self.market_data_agent.get_options_chain(
-                                symbol, target_days_to_expiry=settings.VOLATILITY_TARGET_DTE
+                            options_result = self.market_data_agent.get_options_chain_multi_expiry(
+                                symbol, max_expirations=settings.VOL_SURFACE_MAX_EXPIRATIONS
                             )
                         else:
                             options_result = self.market_data_agent.get_options_chain(symbol)
                         if options_result.success:
                             market_data["options_data"] = options_result.data
                             logger.info(f"Options chain fetched for {symbol}")
+                        else:
+                            logger.warning(f"Options chain fetch failed for {symbol}: {options_result.error_message}")
                 else:
                     state["warnings"].append(f"Could not fetch market data for {symbol}: {stock_result.error_message}")
                     logger.warning(f"Failed to fetch stock data for {symbol}: {stock_result.error_message}")
@@ -842,18 +859,22 @@ class RouterAgent:
                 hist_data = market_data["historical_data"]["data"]
                 price_data = hist_data
             
-            # Prepare options data
+            # Prepare options data across all fetched expirations. Each chain's
+            # calls/puts already carry their own real 'expiration' column (set
+            # by get_options_chain_multi_expiry), so VolatilityAgent can solve
+            # per-option time-to-expiry correctly instead of assuming one date.
             options_data = None
-            if "options_data" in market_data:
-                calls_df = market_data["options_data"]["calls"]
-                puts_df = market_data["options_data"]["puts"]
-                if not calls_df.empty or not puts_df.empty:
-                    options_data = pd.concat([calls_df, puts_df], ignore_index=True)
-                    # Add type column
-                    options_data['type'] = ['call'] * len(calls_df) + ['put'] * len(puts_df)
-                    # Add the real expiration date so VolatilityAgent can compute
-                    # actual time-to-expiry per option instead of assuming 30 days
-                    options_data['expiration'] = market_data["options_data"].get("expiration")
+            if "options_data" in market_data and "chains" in market_data["options_data"]:
+                frames = []
+                for chain in market_data["options_data"]["chains"].values():
+                    calls_df, puts_df = chain["calls"], chain["puts"]
+                    if calls_df.empty and puts_df.empty:
+                        continue
+                    combined = pd.concat([calls_df, puts_df], ignore_index=True)
+                    combined['type'] = ['call'] * len(calls_df) + ['put'] * len(puts_df)
+                    frames.append(combined)
+                if frames:
+                    options_data = pd.concat(frames, ignore_index=True)
             
             # Create volatility inputs
             vol_inputs = VolatilityInputs(
@@ -1717,7 +1738,9 @@ class RouterAgent:
                             "x": price_range,
                             "y": payoff_data.get("total_payoff", []),
                             "strategy_name": final_result.get("strategy_name", "Strategy"),
-                            "breakeven_points": final_result.get("breakeven_points", [])
+                            "breakeven_points": final_result.get("breakeven_points", []),
+                            "max_profit": final_result.get("max_profit"),
+                            "max_loss": final_result.get("max_loss")
                         }
                     }
 
@@ -1877,30 +1900,34 @@ class RouterAgent:
             return {}
     
     def _generate_volatility_surface_data(self, vol_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate volatility surface visualization data"""
+        """Generate 3D volatility surface (moneyness x days-to-expiry x IV) and
+        IV term structure visualization data"""
         try:
-            surface_data = vol_result.get("volatility_surface", {}).get("surface_by_moneyness", {})
-            
-            if not surface_data:
-                return {}
-            
-            moneyness_labels = []
-            volatilities = []
-            
-            moneyness_order = ["deep_otm", "otm", "atm", "itm", "deep_itm"]
-            
-            for moneyness in moneyness_order:
-                if moneyness in surface_data:
-                    moneyness_labels.append(moneyness.replace("_", " ").title())
-                    volatilities.append(surface_data[moneyness]["avg_implied_vol"] * 100)
-            
+            surface = vol_result.get("volatility_surface") or {}
+            term_structure = surface.get("term_structure", [])
+            grid = surface.get("grid")
+
+            if not grid:
+                return {
+                    "available": False,
+                    "reason": surface.get("grid_unavailable_reason", "Insufficient multi-expiry options data"),
+                    "term_structure": term_structure
+                }
+
+            iv_grid_percent = [[v * 100 if v is not None else None for v in row] for row in grid["iv_grid"]]
+
             return {
-                "x": moneyness_labels,
-                "y": volatilities,
-                "title": "Implied Volatility Smile",
-                "ylabel": "Implied Volatility (%)"
+                "available": True,
+                "x": grid["moneyness_axis"],
+                "y": grid["days_to_expiry_axis"],
+                "z": iv_grid_percent,
+                "term_structure": term_structure,
+                "title": "Implied Volatility Surface",
+                "xlabel": "Moneyness (Strike / Spot)",
+                "ylabel": "Days to Expiry",
+                "zlabel": "Implied Volatility (%)"
             }
-            
+
         except Exception as e:
             logger.warning(f"Volatility surface data generation failed: {e}")
             return {}

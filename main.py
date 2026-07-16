@@ -117,17 +117,27 @@ class OptionsAIAgentWithVisualization:
             # Payoff diagram for option pricing
             if query_type == "option_pricing" and viz_data.get("payoff_diagram"):
                 charts["payoff"] = self.visualizer.create_payoff_diagram(
-                    viz_data, 
+                    viz_data,
                     "Option Payoff Analysis"
                 )
-            
+
+            # Strategy payoff diagram — inserted before the shared Greeks
+            # radar chart below (both charts read from viz_data["greeks_chart"],
+            # not a separate "strategy_greeks" key, so this ordering is what
+            # determines payoff-before-greeks in the saved dashboard)
+            if query_type == "strategy_analysis" and viz_data.get("strategy_payoff"):
+                charts["strategy_payoff"] = self.visualizer.create_strategy_payoff_chart(
+                    viz_data,
+                    "Strategy Payoff Analysis"
+                )
+
             # Greeks radar chart
             if viz_data.get("greeks_chart"):
                 charts["greeks"] = self.visualizer.create_greeks_radar_chart(
                     viz_data,
-                    "Option Greeks Profile"
+                    "Strategy Risk Profile" if query_type == "strategy_analysis" else "Option Greeks Profile"
                 )
-            
+
             # Volatility analysis charts
             if query_type == "volatility_analysis":
                 if viz_data.get("volatility_chart"):
@@ -135,29 +145,19 @@ class OptionsAIAgentWithVisualization:
                         viz_data,
                         f"Volatility Analysis"
                     )
-                
+
                 if viz_data.get("volatility_surface"):
-                    # Note: this is a 2D volatility smile (avg IV by moneyness bucket),
-                    # not a true 3D strike x expiry surface — see create_volatility_surface()
                     charts["vol_surface"] = self.visualizer.create_volatility_surface(
                         viz_data,
-                        "Implied Volatility Smile"
+                        "Implied Volatility Surface"
                     )
-            
-            # Strategy analysis charts
-            if query_type == "strategy_analysis":
-                if viz_data.get("strategy_payoff"):
-                    charts["strategy_payoff"] = self.visualizer.create_strategy_payoff_chart(
-                        viz_data,
-                        "Strategy Payoff Analysis"
-                    )
-                
-                if viz_data.get("strategy_greeks"):
-                    charts["strategy_greeks"] = self.visualizer.create_greeks_radar_chart(
-                        viz_data,
-                        "Strategy Risk Profile"
-                    )
-            
+
+                    if viz_data["volatility_surface"].get("term_structure"):
+                        charts["iv_term_structure"] = self.visualizer.create_iv_term_structure_chart(
+                            viz_data,
+                            "IV Term Structure"
+                        )
+
             # Risk management charts
             if query_type == "risk_management":
                 if viz_data.get("risk_dashboard"):
@@ -197,14 +197,10 @@ class OptionsAIAgentWithVisualization:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            for chart_name, fig in charts.items():
-                filename = f"visualizations/{safe_query}_{chart_name}_{timestamp}.html"
-                saved_file = self.visualizer.export_chart_to_html(fig, filename)
-                if saved_file:
-                    chart_files[chart_name] = saved_file
-            
-            # Create dashboard if multiple charts
-            if len(charts) > 1:
+            # Always produce a single combined dashboard file per query,
+            # whether it holds one chart or several — no separate per-chart
+            # files, so a query never generates more than one HTML output.
+            if charts:
                 dashboard_file = f"visualizations/{safe_query}_dashboard_{timestamp}.html"
                 saved_dashboard = self.visualizer.save_dashboard_as_html(charts, dashboard_file)
                 if saved_dashboard:

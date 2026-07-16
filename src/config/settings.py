@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # industry convention (e.g. VIX is a 30-day constant-maturity IV).
     VOLATILITY_TARGET_DTE: int = 30
 
+    # Number of near-term expirations to pull when building an IV term
+    # structure / 3D volatility surface. Bounded because each expiration is a
+    # separate rate-limited yfinance call — some symbols have 15-20+
+    # expirations out to LEAPs, which would make a single query far too slow.
+    VOL_SURFACE_MAX_EXPIRATIONS: int = 8
+
     # ── Risk Management ───────────────────────────────────────────────
     MAX_VOLATILITY: float = 3.0
     MIN_VOLATILITY: float = 0.01

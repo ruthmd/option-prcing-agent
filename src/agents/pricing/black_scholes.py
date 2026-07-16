@@ -237,7 +237,13 @@ class BlackScholesPricingAgent:
             return round(implied_vol, 6)
             
         except Exception as e:
-            logger.warning(f"Implied volatility calculation failed: {e}")
+            # debug, not warning: callers solving IV across a whole options
+            # chain expect a routine fraction of quotes (e.g. deep OTM/ITM
+            # near-zero prices) to have no bracketable root and just skip
+            # them — logging each one at warning level floods the console
+            # when solving across hundreds of options (see volatility_agent's
+            # per-chain summary log for the aggregate skip count instead).
+            logger.debug(f"Implied volatility calculation failed: {e}")
             return None
     
     def sensitivity_analysis(
