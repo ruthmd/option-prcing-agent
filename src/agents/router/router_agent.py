@@ -953,13 +953,27 @@ class RouterAgent:
             
             # Extract strikes
             strikes = self._extract_strategy_strikes(parsed_params, spot_price, strategy_type)
-            
+
+            front_expiry = self._parse_time_to_expiry(parsed_params)
+            if strategy_type == StrategyType.CALENDAR_SPREAD:
+                # Calendar spreads need two genuinely different expiries — a
+                # near-term ("front") leg that's sold and a further-dated
+                # ("back") leg that's bought, at the same strike. The two
+                # legs in the CALENDAR_SPREAD template are [short, long], in
+                # that order, so this list must line up the same way.
+                # Without a real gap here, both legs price as identical
+                # contracts and the whole strategy nets to zero.
+                back_expiry = front_expiry + (30 / 365)
+                expiries = [front_expiry, back_expiry]
+            else:
+                expiries = [front_expiry] * len(strikes)
+
             # Create strategy inputs
             strategy_inputs = StrategyInputs(
                 strategy_type=strategy_type,
                 spot_price=spot_price,
                 strikes=strikes,
-                expiries=[self._parse_time_to_expiry(parsed_params)] * len(strikes),
+                expiries=expiries,
                 risk_free_rate=market_data.get("risk_free_rate", 0.05),
                 volatility=self._get_volatility_estimate(market_data),
                 dividend_yield=market_data.get("dividend_yield", 0.0),

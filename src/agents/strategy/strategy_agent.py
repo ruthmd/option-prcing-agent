@@ -331,7 +331,8 @@ class StrategyAnalysisAgent:
             
             # Generate payoff analysis
             price_range, payoff_data = self._calculate_payoff_analysis(
-                option_legs, stock_legs, inputs.spot_price
+                option_legs, stock_legs, inputs.spot_price,
+                inputs.risk_free_rate, inputs.volatility, inputs.dividend_yield
             )
             
             # Calculate key metrics
@@ -494,35 +495,69 @@ class StrategyAnalysisAgent:
         
         return portfolio_greeks
     
-    def _calculate_payoff_analysis(self, option_legs: List[OptionLeg], stock_legs: List[StockLeg], current_price: float) -> Tuple[List[float], Dict[str, List[float]]]:
-        """Calculate payoff analysis across price range"""
+    def _calculate_payoff_analysis(
+        self,
+        option_legs: List[OptionLeg],
+        stock_legs: List[StockLeg],
+        current_price: float,
+        risk_free_rate: float = 0.05,
+        volatility: float = 0.25,
+        dividend_yield: float = 0.0
+    ) -> Tuple[List[float], Dict[str, List[float]]]:
+        """Calculate payoff analysis across price range.
+
+        Evaluated at the earliest leg expiry. For strategies where every leg
+        shares that same expiry (verticals, straddles, condors, etc.) this is
+        just the standard payoff-at-expiration diagram — every leg is worth
+        pure intrinsic value. But for calendar/diagonal-type strategies,
+        legs can have different expiries: a leg that hasn't reached the
+        evaluation date yet still carries time value and is repriced via
+        Black-Scholes at its remaining time-to-expiry, rather than assumed
+        to be worth intrinsic value like an already-expired leg.
+        """
         # Generate price range (70% to 130% of current price)
         price_range = np.linspace(current_price * 0.7, current_price * 1.3, 100).tolist()
-        
+
         payoff_data = {
             "option_payoffs": [],
             "stock_payoffs": [],
             "total_payoff": []
         }
-        
+
         option_payoffs = []
         stock_payoffs = []
         total_payoffs = []
-        
+
+        evaluation_time = min((leg.expiry for leg in option_legs), default=0.0)
+
         for price in price_range:
-            # Calculate option payoffs at expiration
+            # Calculate option payoffs at the evaluation date
             total_option_payoff = 0
             for leg in option_legs:
-                if leg.option_type == "call":
-                    intrinsic = max(0, price - leg.strike)
+                remaining_time = leg.expiry - evaluation_time
+
+                if remaining_time > 1e-6:
+                    # Leg is still alive at the evaluation date — price it,
+                    # don't assume it's worth intrinsic value yet.
+                    leg_value = self.bs_agent.calculate_option_price(BlackScholesInputs(
+                        spot_price=price,
+                        strike_price=leg.strike,
+                        time_to_expiry=remaining_time,
+                        risk_free_rate=risk_free_rate,
+                        volatility=volatility,
+                        dividend_yield=dividend_yield,
+                        option_type=leg.option_type
+                    )).option_price
+                elif leg.option_type == "call":
+                    leg_value = max(0, price - leg.strike)
                 else:
-                    intrinsic = max(0, leg.strike - price)
-                
+                    leg_value = max(0, leg.strike - price)
+
                 # Account for position and quantity
                 position_sign = 1 if leg.position == "long" else -1
-                leg_payoff = (intrinsic * position_sign - leg.premium / leg.quantity) * leg.quantity
+                leg_payoff = (leg_value * position_sign - leg.premium / leg.quantity) * leg.quantity
                 total_option_payoff += leg_payoff
-            
+
             option_payoffs.append(total_option_payoff)
             
             # Calculate stock payoffs
