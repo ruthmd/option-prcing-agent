@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, END
 # from langgraph.prebuilt import ToolExecutor
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 import numpy as np
+import pandas as pd
 
 from ...providers.factory import get_llm
 from ..grounding.input_validator import InputValidator, ValidationResult
@@ -147,7 +148,21 @@ class RouterAgent:
             state["processing_steps"].append("Input validation completed")
             
             if not validation_result.is_valid:
-                state["errors"].extend(validation_result.errors)
+                # A below-threshold domain-relevance score is a soft signal, not
+                # a hard rejection — _classify_query_node already treats anything
+                # >= 0.3 relevance as "low confidence but domain-relevant" and
+                # processes it normally. It belongs in warnings, not errors: the
+                # final success check in process_query() only excludes errors
+                # containing the word "validation", and this message doesn't,
+                # so leaving it in errors silently fails otherwise-successful
+                # in-domain queries (e.g. pure volatility queries) whenever the
+                # keyword-counting heuristic under-scores them.
+                out_of_domain_msg = ERROR_MESSAGES['out_of_domain']
+                if out_of_domain_msg in validation_result.errors:
+                    state["warnings"].append(out_of_domain_msg)
+                state["errors"].extend(
+                    e for e in validation_result.errors if e != out_of_domain_msg
+                )
                 state["confidence_score"] = validation_result.confidence
             else:
                 # Set initial confidence score from domain relevance
@@ -303,12 +318,25 @@ class RouterAgent:
                             market_data["volatility_data"] = vol_result.data
                             logger.info(f"Historical volatility for {symbol}: {vol_result.data['volatility']:.1%}")
                     
-                    # Get options chain if needed
-                    if query_type in [QueryType.OPTION_PRICING, QueryType.STRATEGY_ANALYSIS, QueryType.ARBITRAGE_DETECTION]:
-                        options_result = self.market_data_agent.get_options_chain(symbol)
+                    # Get options chain if needed. Volatility analysis needs
+                    # several expirations at once (to build an IV term
+                    # structure / surface) rather than the single ~30-day
+                    # chain used before — pricing/strategy/arbitrage queries
+                    # still get literally the nearest available contract,
+                    # since that's what a real trader looking at that option
+                    # would expect.
+                    if query_type in [QueryType.OPTION_PRICING, QueryType.STRATEGY_ANALYSIS, QueryType.ARBITRAGE_DETECTION, QueryType.VOLATILITY_ANALYSIS]:
+                        if query_type == QueryType.VOLATILITY_ANALYSIS:
+                            options_result = self.market_data_agent.get_options_chain_multi_expiry(
+                                symbol, max_expirations=settings.VOL_SURFACE_MAX_EXPIRATIONS
+                            )
+                        else:
+                            options_result = self.market_data_agent.get_options_chain(symbol)
                         if options_result.success:
                             market_data["options_data"] = options_result.data
                             logger.info(f"Options chain fetched for {symbol}")
+                        else:
+                            logger.warning(f"Options chain fetch failed for {symbol}: {options_result.error_message}")
                 else:
                     state["warnings"].append(f"Could not fetch market data for {symbol}: {stock_result.error_message}")
                     logger.warning(f"Failed to fetch stock data for {symbol}: {stock_result.error_message}")
@@ -746,11 +774,24 @@ class RouterAgent:
                     "risk_free_rate": risk_free_rate,
                     "dividend_yield": dividend_yield,
                     "option_type": option_type,
-                    "symbol": symbol
+                    "symbol": symbol,
+                    # Only MonteCarloInputs has these — getattr default handles
+                    # BlackScholes/BinomialTree inputs safely. Downstream output
+                    # validation needs this to know the standard "price >=
+                    # intrinsic value" no-arbitrage bound doesn't apply to
+                    # barrier options (knockout risk can legitimately price
+                    # them below vanilla intrinsic value).
+                    "barrier_type": getattr(inputs, "barrier_type", None),
+                    "asian_type": getattr(inputs, "asian_type", None)
                 },
                 "market_data_source": "live" if market_data.get("stock_data", {}).get("data_quality") else "fallback",
                 "data_timestamp": market_data.get("stock_data", {}).get("last_updated", "unknown")
             }
+
+            # Only MonteCarloResult has convergence_data (BlackScholes/BinomialTree don't)
+            convergence_data = getattr(result, "convergence_data", None)
+            if convergence_data:
+                formatted_result["convergence_data"] = convergence_data
             
             return formatted_result
         
@@ -818,15 +859,22 @@ class RouterAgent:
                 hist_data = market_data["historical_data"]["data"]
                 price_data = hist_data
             
-            # Prepare options data
+            # Prepare options data across all fetched expirations. Each chain's
+            # calls/puts already carry their own real 'expiration' column (set
+            # by get_options_chain_multi_expiry), so VolatilityAgent can solve
+            # per-option time-to-expiry correctly instead of assuming one date.
             options_data = None
-            if "options_data" in market_data:
-                calls_df = market_data["options_data"]["calls"]
-                puts_df = market_data["options_data"]["puts"]
-                if not calls_df.empty or not puts_df.empty:
-                    options_data = pd.concat([calls_df, puts_df], ignore_index=True)
-                    # Add type column
-                    options_data['type'] = ['call'] * len(calls_df) + ['put'] * len(puts_df)
+            if "options_data" in market_data and "chains" in market_data["options_data"]:
+                frames = []
+                for chain in market_data["options_data"]["chains"].values():
+                    calls_df, puts_df = chain["calls"], chain["puts"]
+                    if calls_df.empty and puts_df.empty:
+                        continue
+                    combined = pd.concat([calls_df, puts_df], ignore_index=True)
+                    combined['type'] = ['call'] * len(calls_df) + ['put'] * len(puts_df)
+                    frames.append(combined)
+                if frames:
+                    options_data = pd.concat(frames, ignore_index=True)
             
             # Create volatility inputs
             vol_inputs = VolatilityInputs(
@@ -905,13 +953,27 @@ class RouterAgent:
             
             # Extract strikes
             strikes = self._extract_strategy_strikes(parsed_params, spot_price, strategy_type)
-            
+
+            front_expiry = self._parse_time_to_expiry(parsed_params)
+            if strategy_type == StrategyType.CALENDAR_SPREAD:
+                # Calendar spreads need two genuinely different expiries — a
+                # near-term ("front") leg that's sold and a further-dated
+                # ("back") leg that's bought, at the same strike. The two
+                # legs in the CALENDAR_SPREAD template are [short, long], in
+                # that order, so this list must line up the same way.
+                # Without a real gap here, both legs price as identical
+                # contracts and the whole strategy nets to zero.
+                back_expiry = front_expiry + (30 / 365)
+                expiries = [front_expiry, back_expiry]
+            else:
+                expiries = [front_expiry] * len(strikes)
+
             # Create strategy inputs
             strategy_inputs = StrategyInputs(
                 strategy_type=strategy_type,
                 spot_price=spot_price,
                 strikes=strikes,
-                expiries=[self._parse_time_to_expiry(parsed_params)] * len(strikes),
+                expiries=expiries,
                 risk_free_rate=market_data.get("risk_free_rate", 0.05),
                 volatility=self._get_volatility_estimate(market_data),
                 dividend_yield=market_data.get("dividend_yield", 0.0),
@@ -1144,7 +1206,9 @@ class RouterAgent:
                 context = {
                     "spot_price": final_result.get("inputs", {}).get("spot_price"),
                     "strike": final_result.get("inputs", {}).get("strike_price"),
-                    "option_type": final_result.get("inputs", {}).get("option_type")
+                    "option_type": final_result.get("inputs", {}).get("option_type"),
+                    "barrier_type": final_result.get("inputs", {}).get("barrier_type"),
+                    "asian_type": final_result.get("inputs", {}).get("asian_type")
                 }
             elif validation_type == "greeks":
                 result_to_validate = final_result.get("greeks", {})
@@ -1688,7 +1752,9 @@ class RouterAgent:
                             "x": price_range,
                             "y": payoff_data.get("total_payoff", []),
                             "strategy_name": final_result.get("strategy_name", "Strategy"),
-                            "breakeven_points": final_result.get("breakeven_points", [])
+                            "breakeven_points": final_result.get("breakeven_points", []),
+                            "max_profit": final_result.get("max_profit"),
+                            "max_loss": final_result.get("max_loss")
                         }
                     }
 
@@ -1709,6 +1775,64 @@ class RouterAgent:
                                 portfolio_greeks.get("vega", 0) / 100,
                                 abs(portfolio_greeks.get("rho", 0)) / 100
                             ]
+                        }
+                    }
+
+            elif query_type == QueryType.GREEKS_ANALYSIS and final_result and "error" not in final_result:
+                # Reuses the same "greeks_chart" key/shape as OPTION_PRICING —
+                # _process_greeks_analysis's result carries the identical
+                # delta/gamma/theta/vega/rho shape under "greeks"
+                greeks = final_result.get("greeks", {})
+                if greeks:
+                    viz_data["greeks_chart"] = {
+                        "type": "radar",
+                        "data": {
+                            "labels": ["Delta", "Gamma", "Theta", "Vega", "Rho"],
+                            "values": [
+                                abs(greeks.get("delta", 0)),
+                                greeks.get("gamma", 0) * 10,
+                                abs(greeks.get("theta", 0)) * 10,
+                                greeks.get("vega", 0) / 100,
+                                abs(greeks.get("rho", 0)) / 100
+                            ]
+                        }
+                    }
+
+            elif query_type == QueryType.RISK_MANAGEMENT and final_result and "error" not in final_result:
+                # Prepare risk dashboard (VaR, portfolio Greeks, concentration)
+                risk_metrics = final_result.get("risk_metrics", {})
+                if risk_metrics:
+                    viz_data["risk_dashboard"] = {
+                        "type": "dashboard",
+                        "data": {
+                            "var_data": {
+                                "labels": ["1-Day VaR", "10-Day VaR"],
+                                "values": [
+                                    risk_metrics.get("var_1day", 0),
+                                    risk_metrics.get("var_10day", 0)
+                                ]
+                            },
+                            "greeks_data": {
+                                "labels": ["Delta", "Gamma", "Theta", "Vega"],
+                                "values": [
+                                    risk_metrics.get("total_delta", 0),
+                                    risk_metrics.get("total_gamma", 0),
+                                    risk_metrics.get("total_theta", 0),
+                                    risk_metrics.get("total_vega", 0)
+                                ]
+                            },
+                            "concentration": risk_metrics.get("concentration_risk", {})
+                        }
+                    }
+
+                # Prepare stress test results
+                stress_test_results = final_result.get("stress_test_results", {})
+                if stress_test_results:
+                    viz_data["stress_tests"] = {
+                        "type": "bar",
+                        "data": {
+                            "scenarios": list(stress_test_results.keys()),
+                            "pnl_impact": list(stress_test_results.values())
                         }
                     }
 
@@ -1790,30 +1914,34 @@ class RouterAgent:
             return {}
     
     def _generate_volatility_surface_data(self, vol_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate volatility surface visualization data"""
+        """Generate 3D volatility surface (moneyness x days-to-expiry x IV) and
+        IV term structure visualization data"""
         try:
-            surface_data = vol_result.get("volatility_surface", {}).get("surface_by_moneyness", {})
-            
-            if not surface_data:
-                return {}
-            
-            moneyness_labels = []
-            volatilities = []
-            
-            moneyness_order = ["deep_otm", "otm", "atm", "itm", "deep_itm"]
-            
-            for moneyness in moneyness_order:
-                if moneyness in surface_data:
-                    moneyness_labels.append(moneyness.replace("_", " ").title())
-                    volatilities.append(surface_data[moneyness]["avg_implied_vol"] * 100)
-            
+            surface = vol_result.get("volatility_surface") or {}
+            term_structure = surface.get("term_structure", [])
+            grid = surface.get("grid")
+
+            if not grid:
+                return {
+                    "available": False,
+                    "reason": surface.get("grid_unavailable_reason", "Insufficient multi-expiry options data"),
+                    "term_structure": term_structure
+                }
+
+            iv_grid_percent = [[v * 100 if v is not None else None for v in row] for row in grid["iv_grid"]]
+
             return {
-                "x": moneyness_labels,
-                "y": volatilities,
+                "available": True,
+                "x": grid["moneyness_axis"],
+                "y": grid["days_to_expiry_axis"],
+                "z": iv_grid_percent,
+                "term_structure": term_structure,
                 "title": "Implied Volatility Surface",
-                "ylabel": "Implied Volatility (%)"
+                "xlabel": "Moneyness (Strike / Spot)",
+                "ylabel": "Days to Expiry",
+                "zlabel": "Implied Volatility (%)"
             }
-            
+
         except Exception as e:
             logger.warning(f"Volatility surface data generation failed: {e}")
             return {}

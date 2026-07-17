@@ -210,51 +210,97 @@ class OptionsVisualization:
             return self._create_empty_chart(f"Error creating volatility chart: {str(e)}")
     
     def create_volatility_surface(
-        self, 
+        self,
         viz_data: Dict[str, Any],
         title: str = "Implied Volatility Surface"
     ) -> go.Figure:
-        """Create volatility surface visualization"""
+        """Create a true 3D implied volatility surface (moneyness x days-to-expiry x IV),
+        interpolated from options data spanning multiple expirations."""
         try:
-            if "volatility_surface" not in viz_data:
-                return self._create_empty_chart("No volatility surface data available")
-            
-            surface_data = viz_data["volatility_surface"]
-            
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
+            surface_data = viz_data.get("volatility_surface")
+            if not surface_data or not surface_data.get("available"):
+                reason = (surface_data or {}).get("reason", "No volatility surface data available")
+                return self._create_empty_chart(reason)
+
+            fig = go.Figure(data=[go.Surface(
                 x=surface_data["x"],
                 y=surface_data["y"],
-                mode='lines+markers',
-                name='Implied Volatility',
-                line=dict(color=self.theme_colors["primary"], width=3),
-                marker=dict(size=8),
-                hovertemplate="<b>%{x}</b><br>IV: %{y:.1f}%<extra></extra>"
-            ))
-            
+                z=surface_data["z"],
+                colorscale="Viridis",
+                colorbar=dict(title="IV (%)"),
+                hovertemplate="Moneyness: %{x:.2f}<br>Days to Expiry: %{y:.0f}<br>IV: %{z:.1f}%<extra></extra>"
+            )])
+
             fig.update_layout(
                 title={
                     "text": title,
                     "x": 0.5,
                     "font": {"size": 16, "color": "black"}
                 },
-                xaxis_title="Moneyness",
-                yaxis_title=surface_data.get("ylabel", "Implied Volatility (%)"),
+                scene=dict(
+                    xaxis_title=surface_data.get("xlabel", "Moneyness"),
+                    yaxis_title=surface_data.get("ylabel", "Days to Expiry"),
+                    zaxis_title=surface_data.get("zlabel", "Implied Volatility (%)")
+                ),
                 template="plotly_white",
-                height=400
+                height=550
             )
-            
-            # Add grid
-            fig.update_xaxes(showgrid=True, gridcolor=self.theme_colors["grid"])
-            fig.update_yaxes(showgrid=True, gridcolor=self.theme_colors["grid"])
-            
+
             return fig
-            
+
         except Exception as e:
             logger.error(f"Volatility surface creation failed: {e}")
             return self._create_empty_chart(f"Error creating volatility surface: {str(e)}")
-    
+
+    def create_iv_term_structure_chart(
+        self,
+        viz_data: Dict[str, Any],
+        title: str = "IV Term Structure"
+    ) -> go.Figure:
+        """Create an ATM implied volatility term structure chart (ATM IV by expiry)"""
+        try:
+            surface_data = viz_data.get("volatility_surface") or {}
+            term_structure = surface_data.get("term_structure")
+            if not term_structure:
+                return self._create_empty_chart("No IV term structure data available")
+
+            days = [t["days_to_expiry"] for t in term_structure]
+            atm_iv = [t["atm_implied_vol"] * 100 for t in term_structure]
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=days,
+                y=atm_iv,
+                mode='lines+markers',
+                name='ATM Implied Volatility',
+                line=dict(color=self.theme_colors["primary"], width=3),
+                marker=dict(size=8),
+                hovertemplate="Days to Expiry: %{x}<br>ATM IV: %{y:.1f}%<extra></extra>"
+            ))
+
+            fig.update_layout(
+                title={
+                    "text": title,
+                    "x": 0.5,
+                    "font": {"size": 16, "color": "black"}
+                },
+                xaxis_title="Days to Expiry",
+                yaxis_title="ATM Implied Volatility (%)",
+                template="plotly_white",
+                height=400
+            )
+
+            fig.update_xaxes(showgrid=True, gridcolor=self.theme_colors["grid"])
+            fig.update_yaxes(showgrid=True, gridcolor=self.theme_colors["grid"])
+
+            return fig
+
+        except Exception as e:
+            logger.error(f"IV term structure chart creation failed: {e}")
+            return self._create_empty_chart(f"Error creating IV term structure chart: {str(e)}")
+
+
     def create_monte_carlo_convergence_chart(
         self, 
         convergence_data: Dict[str, Any],
@@ -1206,13 +1252,11 @@ class OptionsVisualization:
                 <html>
                 <head>
                     <title>Options Analysis Dashboard</title>
-                    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
                     <style>
-                        body { font-family: Arial, sans-serif; margin: 20px; }
-                        .chart-container { margin-bottom: 30px; }
+                        body { font-family: Arial, sans-serif; margin: 0; padding: 20px 0; }
                         .dashboard-title { text-align: center; color: #333; margin-bottom: 30px; }
-                        .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-                        @media (max-width: 768px) { .chart-grid { grid-template-columns: 1fr; } }
+                        .chart-grid { display: flex; flex-direction: column; gap: 30px; max-width: 1400px; margin: 0 auto; }
+                        .chart-container { width: 100%; }
                     </style>
                 </head>
                 <body>
@@ -1226,9 +1270,25 @@ class OptionsVisualization:
             # Add charts
             html_parts.append('<div class="chart-grid">')
             
-            for chart_name, fig in dashboard.items():
+            for i, (chart_name, fig) in enumerate(dashboard.items()):
+                # full_html=False is required here: without it, each chart
+                # renders as a complete standalone <html><head><body> document
+                # (Plotly's default), and concatenating several of those into
+                # one page produces invalid, nested <html>/<body> tags.
+                #
+                # include_plotlyjs='cdn' on the first chart only (then False
+                # for the rest) makes Plotly emit a version-pinned CDN URL
+                # matching the installed plotly package, instead of a
+                # hardcoded "plotly-latest.min.js" alias. That alias can lag
+                # behind the Plotly.js version some traces are serialized
+                # for — e.g. numpy-array trace data (used by the payoff
+                # chart's profit/loss fill regions) is encoded as a compact
+                # binary payload that only newer Plotly.js versions can
+                # decode, so a stale CDN build silently drops just those
+                # traces while plain-list traces still render.
                 chart_html = fig.to_html(
-                    include_plotlyjs=False,
+                    include_plotlyjs='cdn' if i == 0 else False,
+                    full_html=False,
                     div_id=f"chart_{chart_name}",
                     config={'displayModeBar': True, 'displaylogo': False}
                 )

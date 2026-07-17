@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 from scipy.stats import norm
+from scipy.interpolate import griddata
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -24,11 +25,16 @@ class VolatilityInputs(BaseModel):
 
 class VolatilityResult(BaseModel):
    """Result of volatility analysis"""
-   historical_volatility: Dict[str, float]
+   # These are typed as Dict[str, Any] rather than Dict[str, float] because
+   # their source methods legitimately mix numeric values with string fields
+   # (e.g. garch_forecast's "forecast_method") or string error messages on
+   # failure paths (e.g. {"error": "..."}) — a strict float-only type would
+   # fail Pydantic validation on those valid, expected shapes.
+   historical_volatility: Dict[str, Any]
    implied_volatility: Dict[str, Any]
    volatility_surface: Optional[Dict[str, Any]] = None
-   volatility_statistics: Dict[str, float]
-   garch_forecast: Optional[Dict[str, float]] = None
+   volatility_statistics: Dict[str, Any]
+   garch_forecast: Optional[Dict[str, Any]] = None
    regime_analysis: Dict[str, Any]
    inputs: VolatilityInputs
 
@@ -152,58 +158,125 @@ class VolatilityAgent:
            logger.warning(f"Garman-Klass calculation failed: {e}")
            return 0.0
    
+   def _solve_option_implied_vols(self, inputs: VolatilityInputs) -> List[Dict[str, Any]]:
+       """Solve implied volatility for every liquid option row in inputs.options_data.
+
+       Returns the full list of option details (one per option that passed
+       liquidity/validity filters) — NOT truncated, since both the summary
+       statistics and the surface/term-structure grid need the complete set
+       (a surface spanning several expirations needs far more than a handful
+       of points, unlike a single-expiration IV table).
+       """
+       if inputs.options_data is None or inputs.options_data.empty:
+           return []
+
+       options_data = inputs.options_data.copy()
+       option_details = []
+       unsolved_count = 0
+
+       for _, option in options_data.iterrows():
+           try:
+               # Extract option details
+               strike = float(option.get('strike', 0))
+
+               # Prefer the live bid/ask midpoint over lastPrice. lastPrice
+               # is whenever the last trade happened — which can be stale
+               # by hours (or the whole session) for a contract that
+               # doesn't trade every minute, even one with decent volume/OI
+               # on the day — while mid_price reflects the current market.
+               mid_price = option.get('mid_price', 0)
+               last_price = option.get('lastPrice', 0)
+               mid_price = 0 if pd.isna(mid_price) else mid_price
+               last_price = 0 if pd.isna(last_price) else last_price
+               market_price = float(mid_price) if mid_price > 0 else float(last_price)
+
+               option_type = option.get('type', 'call').lower()
+
+               if strike <= 0 or market_price <= 0:
+                   continue
+
+               # Skip illiquid quotes. Thin/no trading activity often means
+               # a stale lastPrice that doesn't reflect a real tradeable
+               # market, which back-solves into noisy, unstable implied
+               # volatility even once the expiration mismatch is fixed
+               # (this is what was still inflating the mean IV from a
+               # handful of extreme strikes after that earlier fix).
+               volume = option.get('volume', 0)
+               open_interest = option.get('openInterest', 0)
+               volume = 0 if pd.isna(volume) else volume
+               open_interest = 0 if pd.isna(open_interest) else open_interest
+
+               if volume < settings.MIN_OPTION_VOLUME and open_interest < settings.MIN_OPTION_OPEN_INTEREST:
+                   continue
+
+               # Use the option's actual expiration date when available. A
+               # wrong assumption here (e.g. a fixed 30 days) can badly
+               # mismatch the option's real time value — for a near-dated
+               # chain especially, this makes the IV solver unable to
+               # bracket a root for most strikes since no volatility can
+               # reconcile a 30-day time-value assumption with a market
+               # price reflecting only a few days of time value.
+               expiration_str = option.get('expiration')
+               time_to_expiry = 30 / 365  # fallback if expiration is missing/unparseable
+               days_to_expiry = 30
+               if expiration_str:
+                   try:
+                       expiry_date = datetime.strptime(str(expiration_str), '%Y-%m-%d')
+                       days_to_expiry = (expiry_date - datetime.now()).days
+                       time_to_expiry = max(days_to_expiry, 1) / 365
+                   except ValueError:
+                       pass
+
+               # Calculate implied volatility
+               implied_vol = self.bs_agent.calculate_implied_volatility(
+                   market_price=market_price,
+                   spot_price=inputs.spot_price,
+                   strike_price=strike,
+                   time_to_expiry=time_to_expiry,
+                   risk_free_rate=inputs.risk_free_rate,
+                   dividend_yield=inputs.dividend_yield,
+                   option_type=option_type
+               )
+
+               if implied_vol is not None and 0.01 <= implied_vol <= 3.0:
+                   option_details.append({
+                       'strike': strike,
+                       'market_price': market_price,
+                       'option_type': option_type,
+                       'implied_vol': implied_vol,
+                       'moneyness': strike / inputs.spot_price,
+                       'days_to_expiry': days_to_expiry,
+                       'expiration': str(expiration_str) if expiration_str else None
+                   })
+               else:
+                   unsolved_count += 1
+
+           except Exception as e:
+               logger.debug(f"Failed to calculate IV for option: {e}")
+               unsolved_count += 1
+               continue
+
+       if unsolved_count:
+           logger.info(
+               f"IV solver: {len(option_details)} solved, {unsolved_count} skipped "
+               f"(no bracketable root within vol bounds) out of {len(options_data)} options"
+           )
+
+       return option_details
+
    def _calculate_implied_volatility(self, inputs: VolatilityInputs) -> Dict[str, Any]:
        """Calculate implied volatility from options data"""
        if inputs.options_data is None or inputs.options_data.empty:
            return {"message": "No options data available for implied volatility"}
-       
+
        try:
-           options_data = inputs.options_data.copy()
-           implied_vols = []
-           option_details = []
-           
-           for _, option in options_data.iterrows():
-               try:
-                   # Extract option details
-                   strike = float(option.get('strike', 0))
-                   market_price = float(option.get('lastPrice', option.get('mid_price', 0)))
-                   option_type = option.get('type', 'call').lower()
-                   
-                   if strike <= 0 or market_price <= 0:
-                       continue
-                   
-                   # Calculate time to expiry (simplified - would need actual expiry date)
-                   # For now, assume 30 days as placeholder
-                   time_to_expiry = 30 / 365
-                   
-                   # Calculate implied volatility
-                   implied_vol = self.bs_agent.calculate_implied_volatility(
-                       market_price=market_price,
-                       spot_price=inputs.spot_price,
-                       strike_price=strike,
-                       time_to_expiry=time_to_expiry,
-                       risk_free_rate=inputs.risk_free_rate,
-                       dividend_yield=inputs.dividend_yield,
-                       option_type=option_type
-                   )
-                   
-                   if implied_vol is not None and 0.01 <= implied_vol <= 3.0:
-                       implied_vols.append(implied_vol)
-                       option_details.append({
-                           'strike': strike,
-                           'market_price': market_price,
-                           'option_type': option_type,
-                           'implied_vol': implied_vol,
-                           'moneyness': strike / inputs.spot_price
-                       })
-               
-               except Exception as e:
-                   logger.debug(f"Failed to calculate IV for option: {e}")
-                   continue
-           
-           if not implied_vols:
+           option_details = self._solve_option_implied_vols(inputs)
+
+           if not option_details:
                return {"error": "No valid implied volatilities calculated"}
-           
+
+           implied_vols = [opt['implied_vol'] for opt in option_details]
+
            # Calculate statistics
            implied_vol_stats = {
                "mean_implied_vol": round(np.mean(implied_vols), 6),
@@ -213,37 +286,37 @@ class VolatilityAgent:
                "max_implied_vol": round(np.max(implied_vols), 6),
                "options_analyzed": len(implied_vols)
            }
-           
+
            # ATM implied volatility (closest to spot)
-           if option_details:
-               atm_options = sorted(option_details, key=lambda x: abs(x['moneyness'] - 1.0))
-               if atm_options:
-                   implied_vol_stats["atm_implied_vol"] = round(atm_options[0]['implied_vol'], 6)
-           
+           atm_options = sorted(option_details, key=lambda x: abs(x['moneyness'] - 1.0))
+           if atm_options:
+               implied_vol_stats["atm_implied_vol"] = round(atm_options[0]['implied_vol'], 6)
+
            return {
                "statistics": implied_vol_stats,
                "option_details": option_details[:10]  # Limit to first 10 for brevity
            }
-           
+
        except Exception as e:
            logger.error(f"Implied volatility calculation failed: {e}")
            return {"error": f"Calculation failed: {str(e)}"}
-   
+
    def _build_volatility_surface(self, inputs: VolatilityInputs) -> Dict[str, Any]:
-       """Build volatility surface from options data"""
+       """Build volatility surface from options data: a moneyness-bucket
+       smile summary (kept for backward compatibility), an IV term structure
+       (ATM IV per expiry), and an interpolated moneyness x days-to-expiry
+       IV grid suitable for a 3D surface plot."""
        try:
            if inputs.options_data is None:
                return {"error": "No options data for surface construction"}
-           
-           # This is a simplified implementation
-           # In practice, would need proper expiry dates and more sophisticated interpolation
-           
-           implied_vol_data = self._calculate_implied_volatility(inputs)
-           if "option_details" not in implied_vol_data:
+
+           # Use the full (untruncated) option list — _calculate_implied_volatility's
+           # returned "option_details" is capped at 10 entries for display brevity,
+           # which would starve a multi-expiration grid of most of its points.
+           option_details = self._solve_option_implied_vols(inputs)
+           if not option_details:
                return {"error": "No implied volatility data available"}
-           
-           option_details = implied_vol_data["option_details"]
-           
+
            # Group by moneyness ranges
            moneyness_buckets = {
                "deep_otm": [],    # < 0.9
@@ -252,7 +325,7 @@ class VolatilityAgent:
                "itm": [],         # 1.02 - 1.1
                "deep_itm": []     # > 1.1
            }
-           
+
            for option in option_details:
                moneyness = option['moneyness']
                if moneyness < 0.9:
@@ -265,7 +338,7 @@ class VolatilityAgent:
                    moneyness_buckets["itm"].append(option['implied_vol'])
                else:
                    moneyness_buckets["deep_itm"].append(option['implied_vol'])
-           
+
            # Calculate average IV for each bucket
            surface_data = {}
            for bucket, vols in moneyness_buckets.items():
@@ -274,20 +347,110 @@ class VolatilityAgent:
                        "avg_implied_vol": round(np.mean(vols), 6),
                        "count": len(vols)
                    }
-           
+
            # Calculate volatility skew
            skew_analysis = self._analyze_volatility_skew(option_details)
-           
+
+           term_structure = self._build_iv_term_structure(option_details)
+           grid = self._build_iv_surface_grid(option_details)
+
            return {
                "surface_by_moneyness": surface_data,
                "skew_analysis": skew_analysis,
-               "total_options": len(option_details)
+               "term_structure": term_structure,
+               "total_options": len(option_details),
+               "expirations_analyzed": sorted({
+                   opt['expiration'] for opt in option_details if opt.get('expiration')
+               }),
+               **grid
            }
-           
+
        except Exception as e:
            logger.error(f"Volatility surface construction failed: {e}")
            return {"error": f"Surface construction failed: {str(e)}"}
-   
+
+   def _build_iv_term_structure(self, option_details: List[Dict]) -> List[Dict[str, Any]]:
+       """Build an IV term structure (ATM implied vol per expiry) from priced options"""
+       by_expiration: Dict[str, List[Dict]] = {}
+       for opt in option_details:
+           expiration = opt.get('expiration')
+           if not expiration:
+               continue
+           by_expiration.setdefault(expiration, []).append(opt)
+
+       term_structure = []
+       for expiration, opts in by_expiration.items():
+           # ATM IV = mean IV of options within 2% moneyness of spot, falling
+           # back to the single closest option if none are that close
+           near_atm = [o for o in opts if abs(o['moneyness'] - 1.0) <= 0.02]
+           if not near_atm:
+               near_atm = [min(opts, key=lambda o: abs(o['moneyness'] - 1.0))]
+
+           term_structure.append({
+               "expiration": expiration,
+               "days_to_expiry": opts[0]['days_to_expiry'],
+               "atm_implied_vol": round(np.mean([o['implied_vol'] for o in near_atm]), 6),
+               "options_count": len(opts)
+           })
+
+       return sorted(term_structure, key=lambda t: t['days_to_expiry'])
+
+   def _build_iv_surface_grid(self, option_details: List[Dict]) -> Dict[str, Any]:
+       """Interpolate scattered (moneyness, days_to_expiry, implied_vol) points
+       into a regular grid suitable for a go.Surface plot. Returns {"grid": None,
+       "grid_unavailable_reason": ...} if the data can't support interpolation
+       (too few points, or a degenerate single-value axis)."""
+       points = [
+           (opt['moneyness'], opt['days_to_expiry'], opt['implied_vol'])
+           for opt in option_details if opt.get('expiration')
+       ]
+       distinct_expirations = {opt['expiration'] for opt in option_details if opt.get('expiration')}
+       distinct_moneyness = {p[0] for p in points}
+       distinct_dte = {p[1] for p in points}
+
+       if len(distinct_expirations) < 2 or len(points) < 4 or len(distinct_moneyness) < 2 or len(distinct_dte) < 2:
+           return {
+               "grid": None,
+               "grid_unavailable_reason": (
+                   f"Need at least 2 expirations and 4 priced options spanning "
+                   f"more than one strike/expiry to interpolate a surface "
+                   f"(have {len(distinct_expirations)} expirations, {len(points)} options)"
+               )
+           }
+
+       try:
+           moneyness_vals = np.array([p[0] for p in points])
+           dte_vals = np.array([p[1] for p in points])
+           iv_vals = np.array([p[2] for p in points])
+
+           moneyness_axis = np.linspace(moneyness_vals.min(), moneyness_vals.max(), 25)
+           dte_axis = np.linspace(dte_vals.min(), dte_vals.max(), 15)
+           grid_moneyness, grid_dte = np.meshgrid(moneyness_axis, dte_axis)
+
+           coords = np.column_stack([moneyness_vals, dte_vals])
+           iv_grid = griddata(coords, iv_vals, (grid_moneyness, grid_dte), method='linear')
+           # Linear interpolation leaves NaN outside the convex hull of the
+           # input points — backfill with nearest-neighbor so the plotted
+           # surface has no holes in sparsely-quoted regions.
+           nan_mask = np.isnan(iv_grid)
+           if nan_mask.any():
+               nearest_grid = griddata(coords, iv_vals, (grid_moneyness, grid_dte), method='nearest')
+               iv_grid[nan_mask] = nearest_grid[nan_mask]
+
+           return {
+               "grid": {
+                   "moneyness_axis": moneyness_axis.tolist(),
+                   "days_to_expiry_axis": dte_axis.tolist(),
+                   "iv_grid": iv_grid.tolist()
+               }
+           }
+       except Exception as e:
+           logger.warning(f"IV surface grid interpolation failed: {e}")
+           return {
+               "grid": None,
+               "grid_unavailable_reason": f"Grid interpolation failed: {str(e)}"
+           }
+
    def _analyze_volatility_skew(self, option_details: List[Dict]) -> Dict[str, Any]:
        """Analyze volatility skew patterns"""
        try:
@@ -652,7 +815,7 @@ if __name__ == "__main__":
                print(f"  {key.replace('_', ' ').title()}: {value}")
    
    if result.volatility_surface:
-       print("\nVolatility Surface:")
+       print("\nVolatility Smile (by moneyness bucket):")
        if "surface_by_moneyness" in result.volatility_surface:
            for moneyness, data in result.volatility_surface["surface_by_moneyness"].items():
                print(f"  {moneyness.replace('_', ' ').title()}: {data['avg_implied_vol']:.2%} ({data['count']} options)")

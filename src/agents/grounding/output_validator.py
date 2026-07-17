@@ -122,18 +122,32 @@ class OutputValidator:
             strike = context["strike"]
             option_type = context.get("option_type", "call").lower()
             
-            # Intrinsic value check
+            # Intrinsic value check. This is a real no-arbitrage bound for
+            # vanilla options, but it does NOT hold for barrier options —
+            # e.g. a deep-ITM up-and-out call can legitimately price well
+            # below vanilla intrinsic value because of knockout risk (the
+            # option can be forfeited entirely if the barrier is breached
+            # before expiry). Flag it as a warning instead of a hard failure
+            # when a barrier is involved, since the price may well be correct.
             if option_type == "call":
                 intrinsic = max(0, spot - strike)
             else:
                 intrinsic = max(0, strike - spot)
-            
+
             if price < intrinsic * 0.98:  # Small tolerance
-                result.is_valid = False
-                result.errors.append(
-                    f"Option price ({price:.4f}) below intrinsic value ({intrinsic:.4f})"
-                )
-            
+                if context.get("barrier_type"):
+                    result.warnings.append(
+                        f"Option price ({price:.4f}) is below vanilla intrinsic value ({intrinsic:.4f}), "
+                        f"but this is a {context['barrier_type']} barrier option — knockout risk can "
+                        "legitimately price it below vanilla intrinsic value."
+                    )
+                else:
+                    result.is_valid = False
+                    result.errors.append(
+                        f"Option price ({price:.4f}) below intrinsic value ({intrinsic:.4f})"
+                    )
+
+
             # Reasonable upper bound
             max_reasonable = spot * self.validation_rules["option_price"]["max_reasonable_multiple"]
             if price > max_reasonable:
